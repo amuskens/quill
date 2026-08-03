@@ -50,12 +50,20 @@ enum { iAlignLeft = 2, iAlignCenter = 3, iAlignRight = 4, iAlignJustify = 5 };
 #define kFootnoteDialogID 200
 #define kAboutAlertID     201
 #define kErrorAlertID     202
+#define kWarnAlertID      203
 #define kFootnoteTextItem 4
 #define kDefaultSize      12
 #define kDoubleClickSlop  5
 #define kDoubleClickTicks 30 /* ~0.5s at 60 ticks/sec; GetDblTime() isn't available for this target */
 #define kMaxTouchedParagraphs 200
 #define kEnterKey         0x03 /* numeric-keypad Enter; treated the same as Return */
+
+/* Classic TextEdit tracks every offset (selStart/selEnd/teLength/lineStarts/
+   StyleRun.startChar) as a 16-bit signed INTEGER, so ~32,767 characters is a
+   hard, unraisable ceiling - not a heap/SIZE-resource limit. This warns well
+   before that (about a 10% margin) rather than letting things degrade
+   silently near the real wall. */
+#define kSizeWarnThreshold 28000
 
 static const short kSizes[] = { 9, 10, 12, 14, 18, 24 };
 #define kSizeCount 6
@@ -70,6 +78,7 @@ static short gBodyFontID;
 static short gZoomPercent = 100;
 static unsigned long gLastClickTime = 0;
 static Point gLastClickPt = { 0, 0 };
+static Boolean gSizeWarningShown = false;
 
 static void ToolboxInit(void);
 static void SetupMenus(void);
@@ -95,6 +104,8 @@ static void ToggleFace(Style bit);
 static void SetFontByName(const char *name);
 static void SetSize(short size);
 static void Fail(const char *msg);
+static void Warn(const char *msg);
+static void CheckDocumentSize(void);
 
 static short ScaleSize(short logicalSize);
 static short UnscaleSize(short actualSize);
@@ -220,6 +231,7 @@ static void DoNew(void)
     gDoc.format = kFormatDocx;
     gDoc.dirty = false;
     gZoomPercent = 100;
+    gSizeWarningShown = false;
     TESetAlignment(teJustLeft, gDoc.body);
 
     memset(&ts, 0, sizeof(ts));
@@ -334,6 +346,9 @@ static void DoOpen(void)
     TECalText(gDoc.body);
     ForceRedraw();
     SetWTitle(gDoc.window, reply.sfFile.name);
+
+    gSizeWarningShown = false;
+    CheckDocumentSize();
 }
 
 static long TextLength(void)
@@ -787,6 +802,34 @@ static void Fail(const char *msg)
     StopAlert(kErrorAlertID, NULL);
 }
 
+static void Warn(const char *msg)
+{
+    Str255 s;
+    CToPascal(msg, s);
+    ParamText(s, "\p", "\p", "\p");
+    CautionAlert(kWarnAlertID, NULL);
+}
+
+/* Fires once when the document crosses kSizeWarnThreshold, and resets so it
+   can fire again if the document is trimmed back down and grows past the
+   threshold a second time. See kSizeWarnThreshold's comment for why this
+   can't just be raised instead - it's a hard TextEdit limit, not a tunable. */
+static void CheckDocumentSize(void)
+{
+    long len = TextLength();
+
+    if (len >= kSizeWarnThreshold) {
+        if (!gSizeWarningShown) {
+            gSizeWarningShown = true;
+            Warn("This document is approaching classic TextEdit's hard "
+                 "~32,000-character limit (about 5,000 words). Consider "
+                 "splitting it into more than one document soon.");
+        }
+    } else {
+        gSizeWarningShown = false;
+    }
+}
+
 static void AdjustMenus(void)
 {
     short mode;
@@ -898,6 +941,7 @@ static void HandleEditMenu(short item)
             TEPaste(gDoc.body);
             AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
+            CheckDocumentSize();
             break;
         case iClear:
             pos = (**gDoc.body).selStart;
@@ -1108,12 +1152,14 @@ void RunApp(void)
                         }
                     } else if (c == '\r' || c == kEnterKey) {
                         HandleReturnKey();
+                        CheckDocumentSize();
                     } else {
                         long pos = (**gDoc.body).selStart;
                         long lenBefore = TextLength();
                         TEKey(c, gDoc.body);
                         AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
                         gDoc.dirty = true;
+                        CheckDocumentSize();
                     }
                     break;
                 }

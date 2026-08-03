@@ -185,6 +185,32 @@ both this file — but it does mean a `.qdoc` file hand-edited into an
 unusual shape could confuse it. Malformed/foreign files are detected (missing
 `<quilldoc`/`<body>` tags) and rejected with an error rather than crashing.
 
+## Document size limit
+
+Classic TextEdit tracks every offset it deals with — `selStart`, `selEnd`,
+`teLength`, the line-start table, each style run's start character — as a
+16-bit signed `INTEGER` (confirmed directly in the Toolbox headers this
+toolchain ships). That makes **~32,767 characters (roughly 5,000–5,500
+words, ~20 double-spaced pages) a hard ceiling**, not a tunable one — it's
+not affected by the app's heap size (`SIZE` resource: 512 KB min / 1.5 MB
+pref), which is comfortably large enough that heap exhaustion isn't the
+real constraint here. Approaching the real limit degrades before it
+outright crashes (garbled selection, wrong line breaks), so the safe
+ceiling is somewhat below 32,767, not exactly at it.
+
+Quill warns once (`CheckDocumentSize` in `app.c`, checked after typing,
+pasting, or opening a file) when a document crosses **28,000 characters**
+— about a 10% margin — via a caution alert, then stays quiet unless the
+document is trimmed back under the threshold and crosses it again.
+
+This can't be fixed by "buffering" in the virtual-memory sense — it's an
+*addressing* limit, not a capacity one; more RAM doesn't help a 16-bit
+offset point past 32,767. A real fix means retiring single-TE-record
+TextEdit for large documents in favor of a custom paginated/multi-record
+engine (each chunk its own TE record, swapped in/out as the user scrolls)
+— the same scale of rewrite as true per-paragraph alignment, and, like
+that, deliberately out of scope for this pass.
+
 ## Why .doc is actually RTF
 
 Real binary `.doc` (the OLE2/Compound File Binary + Word `WordDocument`

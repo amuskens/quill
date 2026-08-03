@@ -225,3 +225,25 @@ resource 'DITL' (202) {
         StaticText { enabled, "^0" };
     }
 };
+
+resource 'ALRT' (203) {
+    { 100, 60, 220, 420 },
+    203,
+    {
+        OK, visible, silent;
+        OK, visible, silent;
+        OK, visible, silent;
+        OK, visible, silent;
+    },
+    centerMainScreen
+};
+
+resource 'DITL' (203) {
+    {
+        { 90, 270, 110, 340 },
+        Button { enabled, "OK" };
+
+        { 10, 10, 80, 340 },
+        StaticText { enabled, "^0" };
+    }
+};
