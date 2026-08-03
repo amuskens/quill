@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Retro68 m68k",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "/Users/amuskens/repo/toolchain/Retro68-build/toolchain/multiversal/CIncludes",
+                "/Users/amuskens/repo/toolchain/Retro68-build/toolchain/m68k-apple-macos/include",
+                "/Users/amuskens/repo/toolchain/Retro68-build/toolchain/m68k-apple-macos/RIncludes"
+            ],
+            "compilerPath": "/Users/amuskens/repo/toolchain/Retro68-build/toolchain/bin/m68k-apple-macos-gcc",
+            "cStandard": "gnu17",
+            "compilerArgs": []
+        }
+    ],
+    "version": 4
+}

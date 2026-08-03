@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew search *)",
+      "Bash(brew info *)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.gryphel.com)",
+      "Bash(mkdir -p /Users/amuskens/repo/toolchain/Retro68-build)",
+      "Read(//Users/amuskens/repo/toolchain/**)",
+      "Bash(../Retro68/build-toolchain.bash --no-ppc)",
+      "Bash(tee build.log)",
+      "Bash(xargs -I{} echo {})"
+    ]
+  }
+}
