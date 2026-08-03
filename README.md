@@ -53,6 +53,14 @@ on 68k System 7 (or Mini vMac).
     actually RTF" below.
 - **Open…**: reads `.qdoc` files back (only — see Known limitations for why
   `.docx`/`.rtf`/`.doc` are write-only).
+- **Save-changes confirmation**: New, Open, and Quit all check `gDoc.dirty`
+  first and, if there are unsaved changes, show a Save / Cancel / Don't Save
+  dialog before proceeding — picking Save runs the normal save flow (Save
+  As if the document has no file yet) and only proceeds with New/Open/Quit
+  if that save actually succeeds; Cancel aborts the action entirely, leaving
+  the current document untouched. Quit additionally skips the check (and
+  the dialog) altogether when the document is empty — nothing worth
+  confirming the loss of.
 
 ## Structure
 
@@ -78,9 +86,10 @@ on 68k System 7 (or Mini vMac).
   trade-off is fine here).
 - `src/zip.c` / `zip.h` — minimal ZIP writer (stored entries only) with a
   hand-rolled CRC32.
-- `src/main.r` — Rez resources: menus (`MBAR`/`MENU`), the footnote dialog
-  (`DLOG`/`DITL`), About/error alerts (`ALRT`/`DITL`), and the `SIZE` resource
-  (1.5 MB preferred / 512 KB minimum partition).
+- `src/main.r` — Rez resources: menus (`MBAR`/`MENU`), dialogs (`DLOG`/`DITL`)
+  for the footnote editor and the save-changes confirmation, alerts
+  (`ALRT`/`DITL`) for About/error/warning, and the `SIZE` resource (1.5 MB
+  preferred / 512 KB minimum partition).
 - `CMakeLists.txt` — Retro68 build description (uses its `add_application()`
   CMake helper).
 - `Makefile` — convenience wrapper around the CMake build.
@@ -230,9 +239,6 @@ so it's never a surprise.
   full parser (plus, for `.docx`, a ZIP directory reader) for each format,
   a much bigger lift than `.qdoc`'s reader, which only has to understand
   its own output. Out of scope for this pass.
-- **No unsaved-changes prompt**: New and Open both discard the current
-  document without asking. Consistent with the rest of the app (there's no
-  "are you sure?" anywhere), but worth knowing.
 - **No true superscript on-screen**: classic TextEdit's style byte has bits
   for bold/italic/underline/outline/shadow/condense/extend and nothing else
   — there's no baseline-shift or superscript concept at the Toolbox level.

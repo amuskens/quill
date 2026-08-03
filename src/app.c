@@ -51,6 +51,7 @@ enum { iAlignLeft = 2, iAlignCenter = 3, iAlignRight = 4, iAlignJustify = 5 };
 #define kAboutAlertID     201
 #define kErrorAlertID     202
 #define kWarnAlertID      203
+#define kConfirmDialogID  204
 #define kFootnoteTextItem 4
 #define kDefaultSize      12
 #define kDoubleClickSlop  5
@@ -98,6 +99,8 @@ static void DoNew(void);
 static void DoOpen(void);
 static Boolean DoSaveAs(SaveFormat fmt);
 static void DoSave(void);
+static Boolean SaveBeforeDiscard(void);
+static Boolean ConfirmDiscardChanges(void);
 static void DoInsertFootnote(void);
 static void ClearFootnotes(void);
 static void ToggleFace(Style bit);
@@ -308,6 +311,62 @@ static void DoSave(void)
         return;
     }
     gDoc.dirty = false;
+}
+
+/* Used by ConfirmDiscardChanges's "Save" button: saves in place if the
+   document already has a file (in whatever format it was last saved as),
+   otherwise falls through to a Save As (defaulting to .docx). Returns false
+   if nothing actually got saved - either a write error or the user
+   cancelled the Save As dialog - so the caller knows NOT to discard. */
+static Boolean SaveBeforeDiscard(void)
+{
+    OSErr err;
+
+    if (!gDoc.haveFile)
+        return DoSaveAs(kFormatDocx);
+
+    err = WriteCurrentDocument(gDoc.format);
+    if (err != noErr) {
+        Fail("Could not save the document.");
+        return false;
+    }
+    gDoc.dirty = false;
+    return true;
+}
+
+/* Returns true if it's OK to proceed (discard/replace the current
+   document): either there was nothing unsaved, or the user chose "Don't
+   Save", or the user chose "Save" and it actually succeeded. Returns false
+   for Cancel, or for "Save" if the save itself failed/was cancelled - the
+   caller must not proceed in that case. */
+static Boolean ConfirmDiscardChanges(void)
+{
+    DialogPtr dlg;
+    short itemHit;
+    Str255 title;
+
+    if (!gDoc.dirty)
+        return true;
+
+    GetWTitle(gDoc.window, title);
+    ParamText(title, "\p", "\p", "\p");
+
+    dlg = GetNewDialog(kConfirmDialogID, NULL, (WindowPtr)-1L);
+    if (!dlg)
+        return false;
+
+    for (;;) {
+        ModalDialog(NULL, &itemHit);
+        if (itemHit >= 1 && itemHit <= 3)
+            break;
+    }
+    DisposeDialog(dlg);
+
+    switch (itemHit) {
+        case 1:  return true;                 /* Don't Save */
+        case 3:  return SaveBeforeDiscard();  /* Save */
+        default: return false;                 /* Cancel */
+    }
 }
 
 /* Only .qdoc (Quill's own format) can be opened back - .docx/.rtf/.doc are
@@ -909,14 +968,20 @@ static void AdjustMenus(void)
 static void HandleFileMenu(short item)
 {
     switch (item) {
-        case iNew:          DoNew(); break;
-        case iOpen:          DoOpen(); break;
+        case iNew:           if (ConfirmDiscardChanges()) DoNew(); break;
+        case iOpen:          if (ConfirmDiscardChanges()) DoOpen(); break;
         case iSave:          DoSave(); break;
         case iSaveAsQuill:   DoSaveAs(kFormatQuill); break;
         case iSaveAsDocx:    DoSaveAs(kFormatDocx); break;
         case iSaveAsRtf:     DoSaveAs(kFormatRtf); break;
         case iSaveAsDoc:     DoSaveAs(kFormatDoc); break;
-        case iQuit:          gDone = true; break;
+        case iQuit:
+            /* Only bother confirming if there's actually something in the
+               document - an empty (even if somehow "dirty") document has
+               nothing worth losing, so quit straight away. */
+            if (TextLength() == 0 || ConfirmDiscardChanges())
+                gDone = true;
+            break;
     }
 }
 

@@ -247,3 +247,30 @@ resource 'DITL' (203) {
         StaticText { enabled, "^0" };
     }
 };
+
+resource 'DLOG' (204) {
+    { 100, 60, 210, 380 },
+    dBoxProc,
+    visible,
+    noGoAway,
+    0,
+    204,
+    "Save changes?",
+    centerMainScreen
+};
+
+resource 'DITL' (204) {
+    {
+        { 70, 20, 90, 110 },
+        Button { enabled, "Don\0xd5t Save" };
+
+        { 70, 130, 90, 200 },
+        Button { enabled, "Cancel" };
+
+        { 70, 220, 90, 300 },
+        Button { enabled, "Save" };
+
+        { 10, 10, 55, 300 },
+        StaticText { enabled, "Save changes to \0xd2^0\0xd3 before closing?" };
+    }
+};
