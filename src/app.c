@@ -38,7 +38,7 @@ enum {
     iSizeFirst = 13, iSizeLast = 18
 };
 
-enum { iInsertFootnote = 1 };
+enum { iInsertFootnote = 1, iInsertComment = 2 };
 
 /* Style menu: items 1..kParaStyleCount map directly to ParaStyleKind 0..N-1;
    item kParaStyleCount+1 is a divider. Derived from kParaStyleCount rather
@@ -54,7 +54,8 @@ enum { iAlignLeft = 2, iAlignCenter = 3, iAlignRight = 4, iAlignJustify = 5 };
 #define kErrorAlertID     202
 #define kWarnAlertID      203
 #define kConfirmDialogID  204
-#define kFootnoteTextItem 4
+#define kCommentDialogID  205
+#define kDialogTextItem   4 /* the OK/Cancel/label/EditText layout is shared by the footnote and comment dialogs */
 #define kDefaultSize      12
 #define kDoubleClickSlop  5
 #define kDoubleClickTicks 30 /* ~0.5s at 60 ticks/sec; GetDblTime() isn't available for this target */
@@ -113,6 +114,7 @@ static Boolean SaveBeforeDiscard(void);
 static Boolean ConfirmDiscardChanges(void);
 static void DoInsertFootnote(void);
 static void ClearFootnotes(void);
+static void ClearComments(void);
 static void ToggleFace(Style bit);
 static void SetFontByName(const char *name);
 static void SetSize(short size);
@@ -130,10 +132,13 @@ static void GetSelectionParagraphRange(long *outStart, long *outEnd);
 static short CollectTouchedParagraphs(long selStart, long selEnd, long *starts, long *ends);
 static void ApplyParaStyle(ParaStyleKind kind);
 static void ToggleList(ListKind kind);
-static void AdjustFootnotesAfterEdit(long editPos, long delta);
+static void AdjustMarkersAfterEdit(long editPos, long delta);
 static Footnote *FindFootnoteContainingOffset(long offset);
-static Boolean RunFootnoteDialog(Str255 text);
+static Footnote *FindCommentContainingOffset(long offset);
+static Boolean RunSimpleTextDialog(short dialogID, Str255 text);
 static void EditFootnote(Footnote *fn);
+static void EditComment(Footnote *cm);
+static void DoInsertComment(void);
 static void InsertPlainReturn(void);
 static void HandleReturnKey(void);
 
@@ -363,11 +368,22 @@ static void ClearFootnotes(void)
     gDoc.footnoteCount = 0;
 }
 
+static void ClearComments(void)
+{
+    short i;
+    for (i = 0; i < gDoc.commentCount; i++) {
+        if (gDoc.comments[i].text)
+            DisposeHandle(gDoc.comments[i].text);
+    }
+    gDoc.commentCount = 0;
+}
+
 static void DoNew(void)
 {
     TESetSelect(0, 32767, gDoc.body);
     TEDelete(gDoc.body);
     ClearFootnotes();
+    ClearComments();
     gDoc.haveFile = false;
     gDoc.format = kFormatQuill;
     gZoomPercent = 100;
@@ -398,10 +414,19 @@ static OSErr WriteCurrentDocument(SaveFormat fmt)
     if (fmt == kFormatQuill)
         return WriteDocumentAsQuill(&gDoc, &gDoc.file, gZoomPercent);
 
+    /* Comments survive in .docx and .doc (real w:comment/annotation data),
+       but .rtf export drops them outright - warn before writing so it's
+       not a silent surprise. */
+    if (fmt == kFormatRtf && gDoc.commentCount > 0) {
+        Warn("This document has comments. Comments are not supported in "
+             "plain .rtf export and will be lost - use .docx or .doc "
+             "(which is RTF with comments included) to keep them.");
+    }
+
     savedZoom = gZoomPercent;
     if (savedZoom != 100) RescaleDocument(100);
     err = (fmt == kFormatDocx) ? WriteDocumentAsDocx(&gDoc, &gDoc.file)
-                                : WriteDocumentAsRtf(&gDoc, &gDoc.file);
+                                : WriteDocumentAsRtf(&gDoc, &gDoc.file, fmt == kFormatDoc);
     if (savedZoom != 100) RescaleDocument(savedZoom);
     return err;
 }
@@ -531,6 +556,7 @@ static void DoOpen(void)
     TESetSelect(0, 32767, gDoc.body);
     TEDelete(gDoc.body);
     ClearFootnotes();
+    ClearComments();
 
     err = ReadDocumentFromQuill(&gDoc, &reply.sfFile, &zoomPercent);
     if (err != noErr) {
@@ -617,6 +643,7 @@ static void DoImport(void)
     TESetSelect(0, 32767, gDoc.body);
     TEDelete(gDoc.body);
     ClearFootnotes();
+    ClearComments();
 
     err = ReadDocumentFromRtf(&gDoc, &reply.sfFile);
     if (err != noErr) {
@@ -830,7 +857,7 @@ static void RescaleDocument(short newZoomPercent)
     ForceRedraw();
 }
 
-static void AdjustFootnotesAfterEdit(long editPos, long delta)
+static void AdjustMarkersAfterEdit(long editPos, long delta)
 {
     short i;
     if (delta == 0)
@@ -838,6 +865,10 @@ static void AdjustFootnotesAfterEdit(long editPos, long delta)
     for (i = 0; i < gDoc.footnoteCount; i++) {
         if (gDoc.footnotes[i].anchorOffset >= editPos)
             gDoc.footnotes[i].anchorOffset += delta;
+    }
+    for (i = 0; i < gDoc.commentCount; i++) {
+        if (gDoc.comments[i].anchorOffset >= editPos)
+            gDoc.comments[i].anchorOffset += delta;
     }
 }
 
@@ -852,7 +883,21 @@ static Footnote *FindFootnoteContainingOffset(long offset)
     return NULL;
 }
 
-static Boolean RunFootnoteDialog(Str255 text)
+static Footnote *FindCommentContainingOffset(long offset)
+{
+    short i;
+    for (i = 0; i < gDoc.commentCount; i++) {
+        if (offset >= gDoc.comments[i].anchorOffset &&
+            offset < gDoc.comments[i].anchorOffset + gDoc.comments[i].markerLen)
+            return &gDoc.comments[i];
+    }
+    return NULL;
+}
+
+/* Shared by the footnote and comment dialogs (DLOG/DITL 200 and 205 in
+   main.r) - identical layout (OK=1, Cancel=2, label, EditText=kDialogTextItem),
+   just different title/label text baked into the resource. */
+static Boolean RunSimpleTextDialog(short dialogID, Str255 text)
 {
     DialogPtr dlg;
     short itemType;
@@ -860,13 +905,13 @@ static Boolean RunFootnoteDialog(Str255 text)
     Rect box;
     short itemHit;
 
-    dlg = GetNewDialog(kFootnoteDialogID, NULL, (WindowPtr)-1L);
+    dlg = GetNewDialog(dialogID, NULL, (WindowPtr)-1L);
     if (!dlg)
         return false;
 
-    GetDialogItem(dlg, kFootnoteTextItem, &itemType, &itemH, &box);
+    GetDialogItem(dlg, kDialogTextItem, &itemType, &itemH, &box);
     SetDialogItemText(itemH, text);
-    SelectDialogItemText(dlg, kFootnoteTextItem, 0, 32767);
+    SelectDialogItemText(dlg, kDialogTextItem, 0, 32767);
 
     for (;;) {
         ModalDialog(NULL, &itemHit);
@@ -893,10 +938,30 @@ static void EditFootnote(Footnote *fn)
     BlockMove(*fn->text, &text[1], len);
     HUnlock(fn->text);
 
-    if (RunFootnoteDialog(text)) {
+    if (RunSimpleTextDialog(kFootnoteDialogID, text)) {
         SetHandleSize(fn->text, text[0]);
         if (text[0] > 0)
             BlockMove(&text[1], *fn->text, text[0]);
+        gDoc.dirty = true;
+    }
+}
+
+static void EditComment(Footnote *cm)
+{
+    Str255 text;
+    long len = GetHandleSize(cm->text);
+
+    if (len > 255)
+        len = 255;
+    text[0] = (unsigned char)len;
+    HLock(cm->text);
+    BlockMove(*cm->text, &text[1], len);
+    HUnlock(cm->text);
+
+    if (RunSimpleTextDialog(kCommentDialogID, text)) {
+        SetHandleSize(cm->text, text[0]);
+        if (text[0] > 0)
+            BlockMove(&text[1], *cm->text, text[0]);
         gDoc.dirty = true;
     }
 }
@@ -907,7 +972,10 @@ static void EditFootnote(Footnote *fn)
    such style bit or call in this toolchain), so a real raised, small
    reference mark isn't achievable without a custom text renderer. The
    exported .docx already uses a genuine <w:vertAlign val="superscript">
-   run, independent of this on-screen approximation. */
+   run, independent of this on-screen approximation. Colored pure blue
+   (doColor) so it also reads as a distinct marker at a glance, matching
+   comments' yellow - QuickDraw collapses both to black on a B&W port, so
+   this doesn't need separate handling for non-color Macs. */
 static void DoInsertFootnote(void)
 {
     Str255 text;
@@ -923,7 +991,7 @@ static void DoInsertFootnote(void)
     }
 
     text[0] = 0;
-    if (!RunFootnoteDialog(text))
+    if (!RunSimpleTextDialog(kFootnoteDialogID, text))
         return;
 
     fn = &gDoc.footnotes[gDoc.footnoteCount];
@@ -944,14 +1012,68 @@ static void DoInsertFootnote(void)
     markerStyle.tsSize = (short)(((long)baseStyle.tsSize * 65 + 50) / 100);
     if (markerStyle.tsSize < 6)
         markerStyle.tsSize = 6;
+    markerStyle.tsColor.red = 0x0000;
+    markerStyle.tsColor.green = 0x0000;
+    markerStyle.tsColor.blue = 0xFFFF;
 
     TEInsert(markerBuf, markerLen, gDoc.body);
-    AdjustFootnotesAfterEdit(fn->anchorOffset, markerLen);
+    AdjustMarkersAfterEdit(fn->anchorOffset, markerLen);
     TESetSelect(fn->anchorOffset, fn->anchorOffset + markerLen, gDoc.body);
-    TESetStyle(doSize, &markerStyle, true, gDoc.body);
+    TESetStyle(doSize | doColor, &markerStyle, true, gDoc.body);
     TESetSelect(fn->anchorOffset + markerLen, fn->anchorOffset + markerLen, gDoc.body);
 
     gDoc.footnoteCount++;
+    gDoc.dirty = true;
+    UpdateScrollBarRange();
+}
+
+/* Mirrors DoInsertFootnote, but the in-body marker is a single fixed glyph
+   (kCommentMarkerChar) rather than a printed number - see its comment in
+   wordproc.h for why - shrunk the same ~65% and colored pure yellow. */
+static void DoInsertComment(void)
+{
+    Str255 text;
+    Footnote *cm;
+    long markerLen = 1;
+    TextStyle baseStyle, markerStyle;
+    short baseMode;
+    char markerChar = (char)kCommentMarkerChar;
+
+    if (gDoc.commentCount >= kMaxComments) {
+        Fail("Too many comments in this document.");
+        return;
+    }
+
+    text[0] = 0;
+    if (!RunSimpleTextDialog(kCommentDialogID, text))
+        return;
+
+    cm = &gDoc.comments[gDoc.commentCount];
+    cm->number = gDoc.commentCount + 1;
+    cm->text = NewHandle(text[0]);
+    if (text[0] > 0)
+        BlockMove(&text[1], *cm->text, text[0]);
+
+    cm->anchorOffset = (**gDoc.body).selStart;
+    cm->markerLen = (short)markerLen;
+
+    baseMode = doFont | doSize | doFace;
+    TEContinuousStyle(&baseMode, &baseStyle, gDoc.body);
+    markerStyle = baseStyle;
+    markerStyle.tsSize = (short)(((long)baseStyle.tsSize * 65 + 50) / 100);
+    if (markerStyle.tsSize < 6)
+        markerStyle.tsSize = 6;
+    markerStyle.tsColor.red = 0xFFFF;
+    markerStyle.tsColor.green = 0xFFFF;
+    markerStyle.tsColor.blue = 0x0000;
+
+    TEInsert(&markerChar, markerLen, gDoc.body);
+    AdjustMarkersAfterEdit(cm->anchorOffset, markerLen);
+    TESetSelect(cm->anchorOffset, cm->anchorOffset + markerLen, gDoc.body);
+    TESetStyle(doSize | doColor, &markerStyle, true, gDoc.body);
+    TESetSelect(cm->anchorOffset + markerLen, cm->anchorOffset + markerLen, gDoc.body);
+
+    gDoc.commentCount++;
     gDoc.dirty = true;
     UpdateScrollBarRange();
 }
@@ -1079,7 +1201,7 @@ static void ToggleList(ListKind kind)
         if (existing != kListNone) {
             TESetSelect(starts[i], starts[i] + existingMarkerLen, gDoc.body);
             TEDelete(gDoc.body);
-            AdjustFootnotesAfterEdit(starts[i], -existingMarkerLen);
+            AdjustMarkersAfterEdit(starts[i], -existingMarkerLen);
         }
 
         if (existing != kind) {
@@ -1097,7 +1219,7 @@ static void ToggleList(ListKind kind)
 
             TESetSelect(starts[i], starts[i], gDoc.body);
             TEInsert(marker, markerLen, gDoc.body);
-            AdjustFootnotesAfterEdit(starts[i], markerLen);
+            AdjustMarkersAfterEdit(starts[i], markerLen);
         }
     }
 
@@ -1320,7 +1442,7 @@ static void HandleEditMenu(short item)
             pos = (**gDoc.body).selStart;
             lenBefore = TextLength();
             TECut(gDoc.body);
-            AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
+            AdjustMarkersAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
             UpdateScrollBarRange();
             break;
@@ -1331,7 +1453,7 @@ static void HandleEditMenu(short item)
             pos = (**gDoc.body).selStart;
             lenBefore = TextLength();
             TEPaste(gDoc.body);
-            AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
+            AdjustMarkersAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
             UpdateScrollBarRange();
             CheckDocumentSize();
@@ -1340,7 +1462,7 @@ static void HandleEditMenu(short item)
             pos = (**gDoc.body).selStart;
             lenBefore = TextLength();
             TEDelete(gDoc.body);
-            AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
+            AdjustMarkersAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
             UpdateScrollBarRange();
             break;
@@ -1362,6 +1484,8 @@ static void HandleInsertMenu(short item)
 {
     if (item == iInsertFootnote)
         DoInsertFootnote();
+    else if (item == iInsertComment)
+        DoInsertComment();
 }
 
 static void HandleStyleMenu(short item)
@@ -1402,7 +1526,7 @@ static void InsertPlainReturn(void)
     long pos = (**gDoc.body).selStart;
     long lenBefore = TextLength();
     TEKey('\r', gDoc.body);
-    AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
+    AdjustMarkersAfterEdit(pos, TextLength() - lenBefore);
     gDoc.dirty = true;
 }
 
@@ -1441,7 +1565,7 @@ static void HandleReturnKey(void)
     if (existing != kListNone && paragraphEmpty) {
         TESetSelect(pStart, pEnd, gDoc.body);
         TEDelete(gDoc.body);
-        AdjustFootnotesAfterEdit(pStart, pStart - pEnd);
+        AdjustMarkersAfterEdit(pStart, pStart - pEnd);
         gDoc.dirty = true;
         UpdateScrollBarRange();
         return;
@@ -1464,7 +1588,7 @@ static void HandleReturnKey(void)
         }
 
         TEInsert(marker, newMarkerLen, gDoc.body);
-        AdjustFootnotesAfterEdit(newParaStart, newMarkerLen);
+        AdjustMarkersAfterEdit(newParaStart, newMarkerLen);
         TESetSelect(newParaStart + newMarkerLen, newParaStart + newMarkerLen, gDoc.body);
     }
 
@@ -1538,8 +1662,11 @@ void RunApp(void)
 
                                     if (isDoubleClick) {
                                         Footnote *fn = FindFootnoteContainingOffset((**gDoc.body).selStart);
+                                        Footnote *cm = FindCommentContainingOffset((**gDoc.body).selStart);
                                         if (fn)
                                             EditFootnote(fn);
+                                        else if (cm)
+                                            EditComment(cm);
                                     }
                                 }
                             }
@@ -1590,7 +1717,7 @@ void RunApp(void)
                         long pos = (**gDoc.body).selStart;
                         long lenBefore = TextLength();
                         TEKey(c, gDoc.body);
-                        AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
+                        AdjustMarkersAfterEdit(pos, TextLength() - lenBefore);
                         gDoc.dirty = true;
                         UpdateScrollBarRange();
                         CheckDocumentSize();

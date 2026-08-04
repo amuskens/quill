@@ -162,6 +162,16 @@ static Footnote *FindFootnoteAtOffset(Document *doc, long offset)
     return NULL;
 }
 
+static Footnote *FindCommentAtOffset(Document *doc, long offset)
+{
+    short i;
+    for (i = 0; i < doc->commentCount; i++) {
+        if (doc->comments[i].anchorOffset == offset)
+            return &doc->comments[i];
+    }
+    return NULL;
+}
+
 static void EmitRunProps(DynBuf *out, RunSnap *rs)
 {
     Str255 fname;
@@ -213,6 +223,23 @@ static void EmitFootnoteReferenceRun(DynBuf *out, short number)
     DBAppendStr(out, "\"/></w:r>");
 }
 
+/* The marker is a single point, not a text range, so commentRangeStart and
+   commentRangeEnd bracket a zero-width span right at that point - Word
+   still renders this as a normal anchored comment balloon. */
+static void EmitCommentReferenceRun(DynBuf *out, short number)
+{
+    char num[16];
+    sprintf(num, "%d", (int)number);
+    DBAppendStr(out, "<w:commentRangeStart w:id=\"");
+    DBAppendStr(out, num);
+    DBAppendStr(out, "\"/><w:commentRangeEnd w:id=\"");
+    DBAppendStr(out, num);
+    DBAppendStr(out, "\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr>"
+                      "<w:commentReference w:id=\"");
+    DBAppendStr(out, num);
+    DBAppendStr(out, "\"/></w:r>");
+}
+
 static short FindRunIndexAt(RunSnap *runs, long nRuns, long offset)
 {
     short idx = 0;
@@ -233,6 +260,7 @@ static void EmitParagraphContent(DynBuf *out, Document *doc, RunSnap *runs, long
 
     while (pos < end) {
         Footnote *fn;
+        Footnote *cm;
 
         while (runIdx < nRuns - 1 && pos >= runs[runIdx + 1].startChar) {
             EmitTextRun(out, &runs[runIdx], text + segStart, pos - segStart);
@@ -245,6 +273,15 @@ static void EmitParagraphContent(DynBuf *out, Document *doc, RunSnap *runs, long
             EmitTextRun(out, &runs[runIdx], text + segStart, pos - segStart);
             EmitFootnoteReferenceRun(out, fn->number);
             pos += fn->markerLen;
+            segStart = pos;
+            continue;
+        }
+
+        cm = FindCommentAtOffset(doc, pos);
+        if (cm) {
+            EmitTextRun(out, &runs[runIdx], text + segStart, pos - segStart);
+            EmitCommentReferenceRun(out, cm->number);
+            pos += cm->markerLen;
             segStart = pos;
             continue;
         }
@@ -396,6 +433,36 @@ static void BuildFootnotesXml(Document *doc, DynBuf *out)
     DBAppendStr(out, "</w:footnotes>");
 }
 
+static void BuildCommentsXml(Document *doc, DynBuf *out)
+{
+    short i;
+
+    DBAppendStr(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    DBAppendStr(out, "<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">");
+
+    for (i = 0; i < doc->commentCount; i++) {
+        Footnote *cm = &doc->comments[i];
+        char idbuf[16];
+        char *body;
+        long bodyLen;
+
+        HLock(cm->text);
+        body = *cm->text;
+        bodyLen = GetHandleSize(cm->text);
+
+        sprintf(idbuf, "%d", (int)cm->number);
+        DBAppendStr(out, "<w:comment w:id=\"");
+        DBAppendStr(out, idbuf);
+        DBAppendStr(out, "\" w:author=\"Quill\" w:initials=\"Q\"><w:p><w:r><w:t xml:space=\"preserve\">");
+        DBAppendXMLText(out, body, bodyLen);
+        DBAppendStr(out, "</w:t></w:r></w:p></w:comment>");
+
+        HUnlock(cm->text);
+    }
+
+    DBAppendStr(out, "</w:comments>");
+}
+
 static void BuildStylesXml(DynBuf *out)
 {
     short i;
@@ -407,6 +474,8 @@ static void BuildStylesXml(DynBuf *out)
                       "<w:name w:val=\"footnote reference\"/><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr></w:style>");
     DBAppendStr(out, "<w:style w:type=\"paragraph\" w:styleId=\"FootnoteText\">"
                       "<w:name w:val=\"footnote text\"/><w:rPr><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>");
+    DBAppendStr(out, "<w:style w:type=\"character\" w:styleId=\"CommentReference\">"
+                      "<w:name w:val=\"annotation reference\"/><w:rPr><w:sz w:val=\"16\"/><w:szCs w:val=\"16\"/></w:rPr></w:style>");
 
     for (i = 1; i < kParaStyleCount; i++) {
         char num[16];
@@ -450,6 +519,8 @@ static void BuildContentTypesXml(Document *doc, DynBuf *out)
     DBAppendStr(out, "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>");
     if (doc->footnoteCount > 0)
         DBAppendStr(out, "<Override PartName=\"/word/footnotes.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml\"/>");
+    if (doc->commentCount > 0)
+        DBAppendStr(out, "<Override PartName=\"/word/comments.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml\"/>");
     DBAppendStr(out, "</Types>");
 }
 
@@ -469,6 +540,8 @@ static void BuildDocumentRelsXml(Document *doc, DynBuf *out)
     DBAppendStr(out, "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>");
     if (doc->footnoteCount > 0)
         DBAppendStr(out, "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes\" Target=\"footnotes.xml\"/>");
+    if (doc->commentCount > 0)
+        DBAppendStr(out, "<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"comments.xml\"/>");
     DBAppendStr(out, "</Relationships>");
 }
 
@@ -516,6 +589,14 @@ OSErr WriteDocumentAsDocx(Document *doc, const FSSpec *dest)
         DBInit(&b);
         BuildFootnotesXml(doc, &b);
         err = ZipAddEntry(&zw, "word/footnotes.xml", b.data, b.len);
+        DBFree(&b);
+        if (err != noErr) { ZipClose(&zw); return err; }
+    }
+
+    if (doc->commentCount > 0) {
+        DBInit(&b);
+        BuildCommentsXml(doc, &b);
+        err = ZipAddEntry(&zw, "word/comments.xml", b.data, b.len);
         DBFree(&b);
         if (err != noErr) { ZipClose(&zw); return err; }
     }

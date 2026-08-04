@@ -7,10 +7,10 @@
    Quill's native ".qdoc" format: a small, custom XML dialect this app both
    writes AND reads back, unlike .docx/.rtf/.doc which are write-only export
    targets. It exists so a writing session can be resumed with full
-   fidelity - exact per-run font/size/bold/italic/underline, footnotes
-   (anchor position, marker length, number, body text), current zoom, and
-   current alignment - none of it derived/approximated the way paragraph
-   styles and lists are for export.
+   fidelity - exact per-run font/size/bold/italic/underline/color,
+   footnotes and comments (each an anchor position, marker length, number,
+   and body text), current zoom, and current alignment - none of it
+   derived/approximated the way paragraph styles and lists are for export.
 
    Deliberately NOT a general XML file: the parser below is a small
    hand-rolled scanner tailored to exactly the shape this module itself
@@ -24,20 +24,29 @@
      <?xml version="1.0" encoding="UTF-8"?>
      <quilldoc version="1" zoom="150" align="1">
      <body>
-     <p><r f="Times" s="12" b="0" i="0" u="0">Some text</r></p>
+     <p><r f="Times" s="12" b="0" i="0" u="0" cr="0" cg="0" cb="0">Some text</r></p>
      ...
      </body>
      <footnotes>
      <fn n="1" a="42" m="1">Footnote body text</fn>
      ...
      </footnotes>
+     <comments>
+     <cm n="1" a="42" m="1">Comment body text</cm>
+     ...
+     </comments>
      </quilldoc>
 
    Text is stored as raw Mac OS Roman bytes (this file is only ever read
    back by this same app on the same platform, so there's no need for the
    Unicode transcoding docx.c/rtf.c do) with just the four XML metacharacters
    escaped: & < > ". `align` is whatever teJustLeft/teJustCenter/teJustRight
-   numerically is (0/1/-1), written straight through.
+   numerically is (0/1/-1), written straight through. `cr`/`cg`/`cb` are the
+   raw 16-bit RGBColor components (0-65535 each) - added alongside the
+   marker-coloring feature (blue footnote markers, yellow comment markers)
+   so those colors survive a save/reopen round-trip instead of silently
+   reverting to black; every run carries them, defaulting to 0/0/0 (black)
+   for ordinary text.
 */
 
 /* ---- growable output buffer (mirrors docx.c/rtf.c's) ---- */
@@ -100,6 +109,7 @@ typedef struct {
     short font;
     Style face;
     short size;
+    RGBColor color;
 } RunSnap;
 
 static RunSnap *SnapshotRuns(TEHandle teh, long *outCount, long *outTextLen, char **outText)
@@ -137,10 +147,14 @@ static RunSnap *SnapshotRuns(TEHandle teh, long *outCount, long *outTextLen, cha
             snap[i].font = e.stFont;
             snap[i].face = e.stFace;
             snap[i].size = e.stSize;
+            snap[i].color = e.stColor;
         } else {
             snap[i].font = 0;
             snap[i].face = 0;
             snap[i].size = 12;
+            snap[i].color.red = 0;
+            snap[i].color.green = 0;
+            snap[i].color.blue = 0;
         }
     }
 
@@ -174,6 +188,12 @@ static void EmitRun(DynBuf *out, RunSnap *rs, const char *text, long len)
     DBAppendStr(out, (rs->face & italic) ? "1" : "0");
     DBAppendStr(out, "\" u=\"");
     DBAppendStr(out, (rs->face & underline) ? "1" : "0");
+    DBAppendStr(out, "\" cr=\"");
+    { char n[16]; sprintf(n, "%u", rs->color.red); DBAppendStr(out, n); }
+    DBAppendStr(out, "\" cg=\"");
+    { char n[16]; sprintf(n, "%u", rs->color.green); DBAppendStr(out, n); }
+    DBAppendStr(out, "\" cb=\"");
+    { char n[16]; sprintf(n, "%u", rs->color.blue); DBAppendStr(out, n); }
     DBAppendStr(out, "\">");
     DBAppendEscaped(out, text, len);
     DBAppendStr(out, "</r>");
@@ -258,7 +278,33 @@ static void BuildQuillXml(Document *doc, short zoomPercent, DynBuf *out)
 
         DBAppendStr(out, "</fn>\n");
     }
-    DBAppendStr(out, "</footnotes>\n</quilldoc>\n");
+    DBAppendStr(out, "</footnotes>\n<comments>\n");
+    for (i = 0; i < doc->commentCount; i++) {
+        Footnote *cm = &doc->comments[i];
+        char *body;
+        long bodyLen;
+        char n[16];
+
+        DBAppendStr(out, "<cm n=\"");
+        sprintf(n, "%d", (int)cm->number);
+        DBAppendStr(out, n);
+        DBAppendStr(out, "\" a=\"");
+        sprintf(n, "%ld", cm->anchorOffset);
+        DBAppendStr(out, n);
+        DBAppendStr(out, "\" m=\"");
+        sprintf(n, "%d", (int)cm->markerLen);
+        DBAppendStr(out, n);
+        DBAppendStr(out, "\">");
+
+        HLock(cm->text);
+        body = *cm->text;
+        bodyLen = GetHandleSize(cm->text);
+        DBAppendEscaped(out, body, bodyLen);
+        HUnlock(cm->text);
+
+        DBAppendStr(out, "</cm>\n");
+    }
+    DBAppendStr(out, "</comments>\n</quilldoc>\n");
 
     free(runs);
     free(text);
@@ -361,7 +407,7 @@ static long InsertRunFromTag(Document *doc, long insertPos, const char *tagStart
 {
     char tagBuf[256];
     char fontName[64];
-    long size;
+    long size, cr, cg, cb;
     Boolean b, ital, u;
     Str255 pname;
     short fontID;
@@ -375,6 +421,9 @@ static long InsertRunFromTag(Document *doc, long insertPos, const char *tagStart
     b = (Boolean)(ParseIntAttr(tagBuf, "b", 0) != 0);
     ital = (Boolean)(ParseIntAttr(tagBuf, "i", 0) != 0);
     u = (Boolean)(ParseIntAttr(tagBuf, "u", 0) != 0);
+    cr = ParseIntAttr(tagBuf, "cr", 0);
+    cg = ParseIntAttr(tagBuf, "cg", 0);
+    cb = ParseIntAttr(tagBuf, "cb", 0);
 
     if (contentLen <= 0)
         return insertPos;
@@ -399,9 +448,12 @@ static long InsertRunFromTag(Document *doc, long insertPos, const char *tagStart
     if (b) ts.tsFace |= bold;
     if (ital) ts.tsFace |= italic;
     if (u) ts.tsFace |= underline;
+    ts.tsColor.red = (unsigned short)cr;
+    ts.tsColor.green = (unsigned short)cg;
+    ts.tsColor.blue = (unsigned short)cb;
 
     TESetSelect(insertPos, insertPos + plainLen, doc->body);
-    TESetStyle(doFont | doSize | doFace, &ts, false, doc->body);
+    TESetStyle(doFont | doSize | doFace | doColor, &ts, false, doc->body);
 
     return insertPos + plainLen;
 }
@@ -527,6 +579,50 @@ OSErr ReadDocumentFromQuill(Document *doc, const FSSpec *src, short *outZoomPerc
 
             doc->footnoteCount++;
             fp = fContentEnd + strlen("</fn>");
+        }
+    }
+
+    {
+        const char *cmSecStart = strstr(bodyEnd, "<comments>");
+        const char *cmSecEnd = cmSecStart ? strstr(cmSecStart, "</comments>") : NULL;
+        if (cmSecStart && cmSecEnd) {
+            const char *cp = cmSecStart + strlen("<comments>");
+            while (cp < cmSecEnd && doc->commentCount < kMaxComments) {
+                const char *cStart = strstr(cp, "<cm ");
+                const char *cTagEnd;
+                const char *cContentEnd;
+                char cTagBuf[128];
+                char *plain;
+                long plainLen, contentLen;
+                Footnote *cm;
+
+                if (!cStart || cStart >= cmSecEnd)
+                    break;
+                cTagEnd = strchr(cStart, '>');
+                if (!cTagEnd || cTagEnd > cmSecEnd)
+                    break;
+                cContentEnd = strstr(cTagEnd, "</cm>");
+                if (!cContentEnd || cContentEnd > cmSecEnd)
+                    break;
+
+                ExtractTag(cStart, cTagBuf, sizeof(cTagBuf));
+
+                cm = &doc->comments[doc->commentCount];
+                cm->number = (short)ParseIntAttr(cTagBuf, "n", doc->commentCount + 1);
+                cm->anchorOffset = ParseIntAttr(cTagBuf, "a", 0);
+                cm->markerLen = (short)ParseIntAttr(cTagBuf, "m", 0);
+
+                contentLen = (long)(cContentEnd - (cTagEnd + 1));
+                plain = (char *)malloc(contentLen > 0 ? contentLen : 1);
+                plainLen = contentLen > 0 ? UnescapeInto(cTagEnd + 1, contentLen, plain) : 0;
+                cm->text = NewHandle(plainLen);
+                if (plainLen > 0)
+                    BlockMove(plain, *cm->text, plainLen);
+                free(plain);
+
+                doc->commentCount++;
+                cp = cContentEnd + strlen("</cm>");
+            }
         }
     }
 

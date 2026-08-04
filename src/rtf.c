@@ -147,6 +147,16 @@ static Footnote *FindFootnoteAtOffset(Document *doc, long offset)
     return NULL;
 }
 
+static Footnote *FindCommentAtOffset(Document *doc, long offset)
+{
+    short i;
+    for (i = 0; i < doc->commentCount; i++) {
+        if (doc->comments[i].anchorOffset == offset)
+            return &doc->comments[i];
+    }
+    return NULL;
+}
+
 static short FontTableIndex(short fontID)
 {
     Str255 fname;
@@ -203,11 +213,37 @@ static void EmitFootnoteGroup(DynBuf *out, Handle text)
     DBAppendStr(out, "}");
 }
 
+/* \chatn inserts an annotation reference mark (auto-numbered by the reader)
+   at this point in the main text; the \*-prefixed destinations right after
+   it carry the id/author/text - all marked ignorable-if-unrecognized, which
+   is the conservative, widely-compatible way real-world RTF (including
+   Word's own output) represents comments, rather than requiring every
+   reader to specifically understand \annotation. Only used for .doc export
+   (includeComments) - .rtf export drops comments entirely (see
+   WriteDocumentAsRtf's header comment for why). */
+static void EmitCommentGroup(DynBuf *out, short number, Handle text)
+{
+    char *body;
+    long bodyLen;
+    char idbuf[16];
+
+    sprintf(idbuf, "%d", (int)number);
+    DBAppendStr(out, "\\chatn{\\*\\atnid ");
+    DBAppendStr(out, idbuf);
+    DBAppendStr(out, "}{\\*\\atnauthor Quill}{\\*\\annotation\\pard\\plain\\fs20 ");
+    HLock(text);
+    body = *text;
+    bodyLen = GetHandleSize(text);
+    DBAppendRtfText(out, body, bodyLen);
+    HUnlock(text);
+    DBAppendStr(out, "}");
+}
+
 /* Unlike docx export, list markers are kept as plain visible text here
    (bullet character / "N. ") rather than converted to real RTF list
    numbering (\listtable) - simpler, and RTF is the secondary/legacy export
    target in this app (see README). */
-static void BuildRtfBody(Document *doc, DynBuf *out)
+static void BuildRtfBody(Document *doc, DynBuf *out, Boolean includeComments)
 {
     RunSnap *runs;
     long nRuns, textLen, pos, runIdx, segStart;
@@ -236,6 +272,7 @@ static void BuildRtfBody(Document *doc, DynBuf *out)
 
     while (pos < textLen) {
         Footnote *fn;
+        Footnote *cm;
 
         while (runIdx < nRuns - 1 && pos >= runs[runIdx + 1].startChar) {
             EmitTextRun(out, &runs[runIdx], text + segStart, pos - segStart);
@@ -248,6 +285,16 @@ static void BuildRtfBody(Document *doc, DynBuf *out)
             EmitTextRun(out, &runs[runIdx], text + segStart, pos - segStart);
             EmitFootnoteGroup(out, fn->text);
             pos += fn->markerLen;
+            segStart = pos;
+            continue;
+        }
+
+        cm = FindCommentAtOffset(doc, pos);
+        if (cm) {
+            EmitTextRun(out, &runs[runIdx], text + segStart, pos - segStart);
+            if (includeComments)
+                EmitCommentGroup(out, cm->number, cm->text);
+            pos += cm->markerLen;
             segStart = pos;
             continue;
         }
@@ -276,7 +323,7 @@ static void BuildRtfBody(Document *doc, DynBuf *out)
     free(text);
 }
 
-OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest)
+OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest, Boolean includeComments)
 {
     DynBuf b;
     OSErr err;
@@ -284,7 +331,7 @@ OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest)
     long count;
 
     DBInit(&b);
-    BuildRtfBody(doc, &b);
+    BuildRtfBody(doc, &b, includeComments);
 
     FSpDelete((FSSpecPtr)dest); /* ignore "doesn't exist" error */
 

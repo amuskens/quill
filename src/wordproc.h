@@ -7,6 +7,7 @@
 #include <string.h>
 
 #define kMaxFootnotes 200
+#define kMaxComments 200
 
 /* CopyCStringToPascal/CopyPascalStringToC are Carbon-only in this toolchain;
    these are the 68k-safe equivalents. */
@@ -27,12 +28,28 @@ static void PascalToC(const unsigned char *src, char *dst)
 
 typedef enum { kFormatDocx = 0, kFormatRtf, kFormatDoc, kFormatQuill } SaveFormat;
 
+/* Shared shape for both footnotes and comments - both are "a marker sitting
+   at some offset in the body, with an out-of-line text blob attached to
+   it," differing only in what the marker looks like and where the text
+   ends up on export. Comments reuse this rather than getting a parallel
+   struct with the same four fields under different eyes. */
 typedef struct {
-    short number;       /* 1-based footnote number, in insertion order */
+    short number;       /* 1-based number, in insertion order (comments: an internal id, not shown on-screen) */
     long  anchorOffset;  /* char offset in body text where the marker sits */
     short markerLen;     /* length in chars of the visible in-body marker */
-    Handle text;          /* footnote body text, C string (not Pascal) */
+    Handle text;          /* body text, C string (not Pascal) */
 } Footnote;
+
+/* The in-body comment marker is a single fixed glyph (not a number - a
+   comment isn't "referenced" the way a footnote is, so there's nothing to
+   number on-screen) - the lozenge, chosen because it's not already used
+   for anything else in this app (bullets use kBulletMarkerByte). Colored
+   at insert time (yellow for comments, blue for footnotes - see
+   DoInsertComment/DoInsertFootnote in app.c) so the two are visually
+   distinguishable at a glance on a color Mac; QuickDraw quietly collapses
+   both to black on a B&W port, so no separate monochrome handling is
+   needed. */
+#define kCommentMarkerChar 0xD7 /* Mac OS Roman lozenge, U+25CA */
 
 typedef struct {
     TEHandle body;                 /* styled TextEdit record for the document */
@@ -42,6 +59,8 @@ typedef struct {
     SaveFormat format;              /* which writer Save (not Save As) should use */
     short footnoteCount;
     Footnote footnotes[kMaxFootnotes];
+    short commentCount;
+    Footnote comments[kMaxComments];
     Boolean dirty;
 } Document;
 
@@ -180,8 +199,9 @@ static const unsigned short kMacRomanHigh[128] = {
 OSErr WriteDocumentAsDocx(Document *doc, const FSSpec *dest);
 
 /* rtf.c - also used for the .doc "Save As", which writes RTF content under
-   a .doc name (see rtf.c's header comment for why). */
-OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest);
+   a .doc name (see rtf.c's header comment for why). includeComments: see
+   rtf.h's comment - true for .doc, false (with a prior warning) for .rtf. */
+OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest, Boolean includeComments);
 
 /* native.c - Quill's own .qdoc format: a small custom XML dialect, the only
    one of the four save formats that's also readable, for resuming a

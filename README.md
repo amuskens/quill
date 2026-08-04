@@ -42,11 +42,19 @@ on 68k System 7 (or Mini vMac).
 - **Footnotes**: Insert menu → "Insert Footnote…" opens a dialog to type the
   note; a small in-body marker number is inserted at the cursor, shrunk to
   ~65% size as a superscript approximation (see Known limitations — classic
-  TextEdit has no real superscript). **Double-click a marker** to reopen that
-  same dialog, pre-filled, for editing. On export to `.docx`, the marker is
-  replaced with a real OOXML `footnoteReference` with genuine
-  `vertAlign="superscript"` formatting, independent of the on-screen
+  TextEdit has no real superscript), colored **blue**. **Double-click a
+  marker** to reopen that same dialog, pre-filled, for editing. On export to
+  `.docx`, the marker is replaced with a real OOXML `footnoteReference` with
+  genuine `vertAlign="superscript"` formatting, independent of the on-screen
   approximation.
+- **Comments**: Insert menu → "Insert Comment…" works the same way as
+  footnotes (same dialog pattern, same double-click-to-edit), but the
+  in-body marker is a small **yellow** lozenge (◊) rather than a number —
+  a comment isn't "referenced" by number the way a footnote is, so there's
+  nothing to print on-screen. See "How comments work" below for the marker
+  glyph choice, the color coding, and what happens to comments in each
+  export format — notably, `.doc` and `.rtf` behave *differently* here even
+  though they're otherwise the same writer (see "Why .doc is actually RTF").
 - **Save / Save As → .qdoc, .docx, .rtf, or .doc**: plain **Save** (⌘S) on a
   document with no file yet defaults to `.qdoc`, not an export format —
   dedicated "Save As .docx/.rtf/.doc" menu items exist for when an export
@@ -382,9 +390,15 @@ independent flat inset that happened not to agree with it.
 header comment. Unlike `.docx`/`.rtf`, nothing is derived or approximated —
 it stores exactly what's needed to resume editing losslessly:
 
-- Every run's actual font/size/bold/italic/underline (not the
-  content-derived paragraph-style/list detection docx/rtf export use).
-- Every footnote's number, anchor offset, marker length, and body text.
+- Every run's actual font/size/bold/italic/underline/color (not the
+  content-derived paragraph-style/list detection docx/rtf export use) — the
+  color field was added alongside comments/footnote-coloring specifically so
+  those marker colors survive a save/reopen round-trip rather than quietly
+  reverting to black; ordinary text just carries black (0/0/0) and round-trips
+  unchanged.
+- Every footnote's and comment's number, anchor offset, marker length, and
+  body text (in separate `<footnotes>`/`<comments>` sections — see "How
+  comments work" for why they're parallel structures, not one shared list).
 - The current zoom percentage and alignment, saved and restored as-is (this
   is the one format that does *not* normalize to 100% zoom before writing —
   the whole point is faithfully resuming the session you were just in).
@@ -479,12 +493,67 @@ does handle:
   `header`/`footer` variants, `generator`).
 
 What it deliberately does **not** attempt: paragraph alignment, lists/
-tables, embedded pictures/objects, and footnotes (the `\footnote` group is
-skipped rather than reconstructed as a real Quill footnote — recovering the
-anchor position correctly would need more bookkeeping than this pass
-covers). Imported content is treated as a new, unsaved document — `File →
-Save` offers Save As `.qdoc`, it does not silently overwrite the original
-`.rtf`/`.doc` file.
+tables, embedded pictures/objects, footnotes, and comments (the `\footnote`
+and `\*\annotation` groups are both skipped rather than reconstructed as
+real Quill footnotes/comments — recovering the anchor position correctly
+would need more bookkeeping than this pass covers). Imported content is
+treated as a new, unsaved document — `File → Save` offers Save As `.qdoc`,
+it does not silently overwrite the original `.rtf`/`.doc` file.
+
+## How comments work
+
+Comments work like footnotes (Insert menu, a modal dialog, double-click a
+marker to reopen it for editing) but are a genuinely separate feature under
+the hood — `DoInsertComment`/`EditComment`/`FindCommentContainingOffset` in
+`app.c`, a parallel `comments[]`/`commentCount` on `Document` alongside the
+existing `footnotes[]`/`footnoteCount` (both reuse the same `Footnote`
+struct shape - see wordproc.h - since a comment is structurally identical:
+an anchor offset, a marker length, and an out-of-line text blob).
+
+**The marker.** Classic TextEdit can only draw glyphs from a font — there's
+no way to embed an actual bitmap icon inline in the text flow — so "a little
+comment icon" is, concretely, a single fixed character: the lozenge (◊,
+Mac OS Roman `0xD7`), chosen because nothing else in this app already uses
+it (bullets use a different byte, `kBulletMarkerByte`). Footnotes keep
+their existing on-screen behavior (the actual number, shrunk to ~65%) — a
+footnote *is* referenced by number, a comment isn't, so there was nothing
+to change there except color. Both marker kinds are colored via
+`TESetStyle`'s `doColor` mode at insertion time: footnotes pure blue,
+comments pure yellow. This is unconditional, not a "detect a color Mac" branch —
+QuickDraw quietly collapses any RGB color to black on a B&W port on its
+own, so a single code path handles both correctly.
+
+**Export.** `.docx` gets real Word comments: `word/comments.xml`, a
+`CommentReference` character style, and — spliced into `document.xml` in
+place of the marker character, the same splice-out-and-replace trick
+footnotes and list markers already use — a zero-width
+`commentRangeStart`/`commentRangeEnd` pair plus a `commentReference` run.
+Word shows these as normal anchored comment balloons. `.qdoc` round-trips
+comments losslessly, same as footnotes, via a `<comments>`/`<cm>` section
+mirroring `<footnotes>`/`<fn>` (see "How .qdoc works").
+
+**`.doc` and `.rtf` behave differently here**, despite being the exact same
+underlying writer (`WriteDocumentAsRtf` in `rtf.c`) - see "Why .doc is
+actually RTF" for why that's normally a non-issue. Real RTF has a genuine,
+if legacy, comment mechanism: `\chatn` (an auto-numbered annotation
+reference mark) paired with `{\*\atnid}{\*\atnauthor}{\*\annotation}`
+destinations, all conventionally `\*`-prefixed (ignorable-if-unrecognized)
+the way real-world RTF - including Word's own output - writes them, rather
+than requiring every reader to specifically understand `\annotation`.
+`WriteDocumentAsRtf` takes an `includeComments` flag so callers can choose:
+"Save As .doc" passes `true` (comments survive, since a `.doc` file is
+expected to carry them), "Save As .rtf" passes `false` (comments are
+dropped) - **and warns first** if the document has any, so losing them on
+plain RTF export is a visible, deliberate tradeoff, not a silent one. Either
+way the marker character itself is always spliced out of the body text, so
+a stray, meaningless lozenge glyph never leaks into exported RTF either.
+
+**Reading them back**: only `.qdoc` can. RTF Import treats `\*`-prefixed
+groups (which includes `\*\annotation`) as an unconditionally skippable
+destination - correct in the sense that it won't corrupt anything, but it
+means importing a `.doc` this app itself wrote loses that document's
+comments on the way back in, the same way footnotes are already dropped on
+import (see "Importing foreign files").
 
 ## Document size limit
 
@@ -523,6 +592,13 @@ trick that only sometimes works: Word and virtually every other word
 processor identify RTF by its content header regardless of file extension,
 so a `.doc`-named RTF file opens correctly everywhere. It's documented here
 so it's never a surprise.
+
+One deliberate exception to ".doc and .rtf are the same output": comments.
+`WriteDocumentAsRtf` takes an `includeComments` flag, `true` for `.doc` and
+`false` (with a warning shown first) for `.rtf` — a `.doc` file is expected
+to be able to carry Word-style comments, a plain `.rtf` export is treated
+as the lighter-weight "just the formatted text" option. See "How comments
+work" above for the actual RTF syntax involved.
 
 ## The app icon
 
@@ -620,9 +696,13 @@ necessary.
   has at all (no stretch-to-margins algorithm), so the Justify menu item
   maps to left-align — the closest available option — rather than being
   silently absent.
-- **Footnote text is capped at 255 characters** (`GetDialogItemText` returns
-  a Pascal string) and footnotes are **numbered by insertion order**, not
-  reflowed if you delete one.
+- **Footnote and comment text are both capped at 255 characters**
+  (`GetDialogItemText`/`RunSimpleTextDialog` return a Pascal string), and
+  footnotes are **numbered by insertion order**, not reflowed if you delete
+  one (comments aren't numbered on-screen at all — see "How comments work").
+- **Comments aren't reconstructed by Import**, same as footnotes — RTF's
+  `\*\annotation` destination is recognized and safely skipped, not
+  round-tripped back into a real Quill comment.
 - **No OS-level clipboard sync**: `TEToScrap`/`TEFromScrap` are declared but
   not actually implemented for the 68k target in this toolchain (Carbon-only
   in the headers), so Cut/Copy/Paste work fine *within* the app but won't

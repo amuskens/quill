@@ -106,6 +106,7 @@ resource 'MENU' (132, preload) {
     "Insert",
     {
         "Insert Footnote\0xc9", noIcon, noKey, noMark, plain;
+        "Insert Comment\0xc9", noIcon, noKey, noMark, plain;
     }
 };
 
@@ -179,6 +180,33 @@ resource 'DITL' (200) {
 
         { 10, 10, 26, 290 },
         StaticText { enabled, "Footnote text:" };
+
+        { 30, 10, 75, 290 },
+        EditText { enabled, "" };
+    }
+};
+
+resource 'DLOG' (205) {
+    { 100, 100, 220, 400 },
+    dBoxProc,
+    visible,
+    noGoAway,
+    0,
+    205,
+    "Insert Comment",
+    centerMainScreen
+};
+
+resource 'DITL' (205) {
+    {
+        { 90, 220, 110, 290 },
+        Button { enabled, "OK" };
+
+        { 90, 130, 110, 200 },
+        Button { enabled, "Cancel" };
+
+        { 10, 10, 26, 290 },
+        StaticText { enabled, "Comment text:" };
 
         { 30, 10, 75, 290 },
         EditText { enabled, "" };
