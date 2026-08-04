@@ -83,9 +83,9 @@ typedef struct {
    indistinguishable: applying Quote will show/export as Heading 2. */
 static const ParaStyleSpec kParaStyleSpecs[kParaStyleCount] = {
     {12, false, false, false}, /* Normal */
-    {14, false, false, false}, /* Heading 1 */
-    {12, false, true,  false}, /* Heading 2 */
-    {12, false, false, true},  /* Heading 3 */
+    {14, true, false, false}, /* Heading 1 */
+    {12, true, true,  false}, /* Heading 2 */
+    {12, true, false, true},  /* Heading 3 */
     {12, false, true,  true},  /* Heading 4 */
     {12, false, true,  false}, /* Quote - same combo as Heading 2, see note above */
     {10, false, false, false}  /* Bibliography */
