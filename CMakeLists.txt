@@ -9,6 +9,7 @@ add_application(Quill
     src/native.c
     src/zip.c
     src/main.r
+    CREATOR "Quil"
 )
 
 set_target_properties(Quill PROPERTIES COMPILE_OPTIONS -ffunction-sections)

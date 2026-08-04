@@ -92,9 +92,12 @@ on 68k System 7 (or Mini vMac).
 - `src/main.r` — Rez resources: menus (`MBAR`/`MENU`), dialogs (`DLOG`/`DITL`)
   for the footnote editor and the save-changes confirmation, alerts
   (`ALRT`/`DITL`) for About/error/warning, and the `SIZE` resource (1.5 MB
-  preferred / 512 KB minimum partition).
+  preferred / 512 KB minimum partition). `#include`s `icon.r`.
+- `src/icon.r` — the app icon (`BNDL`/`FREF`/`ICN#`/`ics#`/`icl4`/`ics4`) —
+  see "The app icon" below.
 - `CMakeLists.txt` — Retro68 build description (uses its `add_application()`
-  CMake helper).
+  CMake helper; also sets the app's creator code to `Quil`, matching
+  `icon.r`'s `BNDL` signature).
 - `Makefile` — convenience wrapper around the CMake build.
 
 ## How paragraph styles/lists work
@@ -245,6 +248,33 @@ trick that only sometimes works: Word and virtually every other word
 processor identify RTF by its content header regardless of file extension,
 so a `.doc`-named RTF file opens correctly everywhere. It's documented here
 so it's never a surprise.
+
+## The app icon
+
+A bold "Q" letterform (a ring plus a diagonal flourish tail, like a
+handwritten capital Q) in 4 colors from the standard classic Mac OS 16-color
+icon palette: white background, black outline, brown ring fill, blue tail.
+Provided as both a 1-bit fallback (`ICN#`/`ics#`, 32×32 and 16×16) and true
+color (`icl4`/`ics4`, 4-bit/16-color depth, though only 4 of the 16 are
+actually used).
+
+The pixel data was generated programmatically (a small Python script doing
+circle/line-segment distance math, not hand-plotted) rather than
+transcribed by hand — accurately hand-plotting ~1KB of hex bitmap data
+across four resources is exactly the kind of tedious, error-prone task a
+script does more reliably. The 16-color palette's index order (0=white,
+1=yellow, ... 15=black — `icl4`/`ics4` reference colors by index into this
+*fixed system palette*, not an arbitrary embedded one) was cross-checked
+against two independent sources rather than trusted from memory, since
+getting an index wrong would silently produce a wrong-but-plausible-looking
+color.
+
+`src/icon.r` also defines the `BNDL`/`FREF` pair that tells Finder to
+actually use this icon for the app: `BNDL`'s signature (`'Quil'`) must match
+the app's own creator code, which `CMakeLists.txt` sets via
+`add_application(... CREATOR "Quil")` — without that match, Finder falls
+back to the generic application icon regardless of what icon resources
+exist in the file.
 
 ## Known limitations
 

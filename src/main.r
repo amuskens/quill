@@ -1,6 +1,7 @@
 #include "Types.r"
 #include "Dialogs.r"
 #include "Processes.r"
+#include "icon.r"
 
 resource 'SIZE' (-1) {
     reserved,
