@@ -46,6 +46,7 @@ resource 'MENU' (129, preload) {
     {
         "New Document/N", noIcon, noKey, noMark, plain;
         "Open\0xc9/O", noIcon, noKey, noMark, plain;
+        "Import (.rtf/.doc)\0xc9", noIcon, noKey, noMark, plain;
         "Save/S", noIcon, noKey, noMark, plain;
         "Save As Quill Document\0xc9", noIcon, noKey, noMark, plain;
         "Save As Word Document (.docx)\0xc9", noIcon, noKey, noMark, plain;

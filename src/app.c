@@ -25,9 +25,9 @@ enum {
 enum { iAbout = 1 };
 
 enum {
-    iNew = 1, iOpen = 2, iSave = 3,
-    iSaveAsQuill = 4, iSaveAsDocx = 5, iSaveAsRtf = 6, iSaveAsDoc = 7,
-    iQuit = 9
+    iNew = 1, iOpen = 2, iImport = 3, iSave = 4,
+    iSaveAsQuill = 5, iSaveAsDocx = 6, iSaveAsRtf = 7, iSaveAsDoc = 8,
+    iQuit = 10
 };
 
 enum { iUndo = 1, iCut = 3, iCopy = 4, iPaste = 5, iClear = 6 };
@@ -104,6 +104,7 @@ static void HandleZoomMenu(short item);
 static void AdjustMenus(void);
 static void DoNew(void);
 static void DoOpen(void);
+static void DoImport(void);
 static Boolean DoSaveAs(SaveFormat fmt);
 static void DoSave(void);
 static Boolean SaveBeforeDiscard(void);
@@ -218,6 +219,18 @@ static void CreateDocumentWindow(void)
     gDoc.format = kFormatQuill;
     gDoc.footnoteCount = 0;
 
+    /* Start maximized: zoom to the Window Manager's standard (full-screen)
+       state, then re-lay-out TE/the scrollbar for the new size, same as a
+       user clicking the zoom box would trigger. Deliberately done *before*
+       establishing Normal below, not after: ResizeDocumentWindow replaces
+       destRect/viewRect outright and calls TECalText on what is, at this
+       point, a still-empty TE record - style should be established once,
+       last, on the window in its final settled state, rather than possibly
+       having a layout/recalc pass run between "apply Normal" and "user can
+       start typing" that there's no real guarantee leaves it alone. */
+    ZoomWindow(gDoc.window, inZoomOut, true);
+    ResizeDocumentWindow();
+
     /* Establish Normal (Times/12pt/plain) as the document's actual style,
        through the same ApplyParaStyle path a user's "Normal" menu choice
        uses - not a separately hand-set TESetStyle call that happens to
@@ -228,12 +241,6 @@ static void CreateDocumentWindow(void)
        reset right after. */
     ApplyParaStyle(pStyleNormal);
     gDoc.dirty = false;
-
-    /* Start maximized: zoom to the Window Manager's standard (full-screen)
-       state, then re-lay-out TE/the scrollbar for the new size, same as a
-       user clicking the zoom box would trigger. */
-    ZoomWindow(gDoc.window, inZoomOut, true);
-    ResizeDocumentWindow();
 }
 
 /* Used after a grow-box drag resize or a zoom-box click: re-lays-out the TE
@@ -535,6 +542,94 @@ static void DoOpen(void)
     gDoc.file = reply.sfFile;
     gDoc.dirty = false;
     gZoomPercent = zoomPercent;
+
+    TESetSelect(0, 0, gDoc.body);
+    TECalText(gDoc.body);
+    UpdateScrollBarRange();
+    ForceRedraw();
+    SetWTitle(gDoc.window, reply.sfFile.name);
+
+    gSizeWarningShown = false;
+    CheckDocumentSize();
+}
+
+/* Imports .rtf, and .doc files that are actually RTF content under a .doc
+   name (as this app's own "Save As .doc" produces, and as many real-world
+   ".doc" files in the wild turn out to be) - see ReadDocumentFromRtf's
+   header comment for exactly what is/isn't recovered. Genuine binary OLE2
+   .doc and .docx (DEFLATE-compressed ZIP) are both out of scope; detected
+   by content, not extension, and rejected with an explanatory message
+   rather than silently producing garbage. No type/creator filtering on the
+   StandardGetFile call, same reasoning as DoOpen - a file brought over from
+   a modern system won't reliably carry meaningful classic Mac type codes,
+   so content sniffing is the only reliable signal. */
+static void DoImport(void)
+{
+    StandardFileReply reply;
+    short refNum;
+    long fileLen, count;
+    char head[8];
+    OSErr err;
+
+    StandardGetFile(NULL, -1, NULL, &reply);
+    if (!reply.sfGood)
+        return;
+
+    err = FSpOpenDF(&reply.sfFile, fsRdPerm, &refNum);
+    if (err != noErr) {
+        Fail("Could not open that file.");
+        return;
+    }
+    err = GetEOF(refNum, &fileLen);
+    if (err != noErr) {
+        FSClose(refNum);
+        Fail("Could not open that file.");
+        return;
+    }
+    count = (fileLen < 8) ? fileLen : 8;
+    FSRead(refNum, &count, head);
+    FSClose(refNum);
+
+    if (!(count >= 5 && strncmp(head, "{\\rtf", 5) == 0)) {
+        if (count >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 3 && head[3] == 4) {
+            Fail("That looks like a .docx file. Importing .docx isn\xd5t "
+                 "supported yet \xd0 only .rtf files, and .doc files that "
+                 "are actually RTF content, can be imported.");
+        } else if (count >= 4 && (unsigned char)head[0] == 0xD0 &&
+                   (unsigned char)head[1] == 0xCF && (unsigned char)head[2] == 0x11 &&
+                   (unsigned char)head[3] == 0xE0) {
+            Fail("That's a real binary Word (.doc) file, which this app "
+                 "can\xd5t parse \xd0 only .rtf files, and .doc files that "
+                 "are actually RTF content, can be imported.");
+        } else {
+            Fail("That file doesn\xd5t look like RTF. Only .rtf files, and "
+                 ".doc files that are actually RTF content, can be imported.");
+        }
+        return;
+    }
+
+    Warn("Import is best-effort: only text, bold, italic, underline, font, "
+         "and size are recovered. Paragraph alignment, lists, tables, "
+         "footnotes, and embedded objects are not imported.");
+
+    TESetSelect(0, 32767, gDoc.body);
+    TEDelete(gDoc.body);
+    ClearFootnotes();
+
+    err = ReadDocumentFromRtf(&gDoc, &reply.sfFile);
+    if (err != noErr) {
+        Fail("That file could not be imported.");
+        DoNew();
+        return;
+    }
+
+    /* Imported content isn't the same file as its source - "Save" should
+       offer Save As .qdoc, not silently overwrite the original .rtf/.doc,
+       so haveFile/file are deliberately left as a "new" document's. */
+    gDoc.haveFile = false;
+    gDoc.format = kFormatQuill;
+    gDoc.dirty = true;
+    gZoomPercent = 100;
 
     TESetSelect(0, 0, gDoc.body);
     TECalText(gDoc.body);
@@ -1195,6 +1290,7 @@ static void HandleFileMenu(short item)
     switch (item) {
         case iNew:           if (ConfirmDiscardChanges()) DoNew(); break;
         case iOpen:          if (ConfirmDiscardChanges()) DoOpen(); break;
+        case iImport:        if (ConfirmDiscardChanges()) DoImport(); break;
         case iSave:          DoSave(); break;
         case iSaveAsQuill:   DoSaveAs(kFormatQuill); break;
         case iSaveAsDocx:    DoSaveAs(kFormatDocx); break;

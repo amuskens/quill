@@ -64,7 +64,9 @@ on 68k System 7 (or Mini vMac).
   - `.rtf` / `.doc`: hand-rolled RTF writer (`src/rtf.c`) — see "Why .doc is
     actually RTF" below.
 - **Open…**: reads `.qdoc` files back (only — see Known limitations for why
-  `.docx`/`.rtf`/`.doc` are write-only).
+  `.docx`/`.rtf`/`.doc` remain write-only via Save As).
+- **Import…**: best-effort import of `.rtf` files, and `.doc` files that are
+  actually RTF content — see "Importing foreign files" below.
 - **Save-changes confirmation**: New, Open, and Quit all check `gDoc.dirty`
   first and, if there are unsaved changes, show a Save / Cancel / Don't Save
   dialog before proceeding — picking Save runs the normal save flow (Save
@@ -152,6 +154,19 @@ export), piggybacking on TextEdit's own tracking instead of duplicating it:
   separate hand-written `TESetStyle` call that happened to produce matching
   numbers - so there's exactly one place that defines what "Normal" means,
   and startup can't quietly drift from it.
+
+  **Gotcha**: when "start maximized" was added to `CreateDocumentWindow`
+  (see "The window chrome" below), `ApplyParaStyle(pStyleNormal)` was still
+  being called *before* the `ZoomWindow`/`ResizeDocumentWindow` pair that
+  actually resizes the window and re-lays-out TE - meaning Normal was
+  established on the window at its small initial size, with a layout pass
+  over a still-empty TE record happening afterward, on the exact same
+  handle, with no real guarantee that pass leaves the null style alone.
+  `ApplyParaStyle(pStyleNormal)` is now called *last*, after the window has
+  settled at its final maximized size - style is established once, on the
+  window in the state it'll actually be in when the user starts typing,
+  rather than being established and then having something else run after it
+  with an unclear effect on that state.
 
 ## How zoom works
 
@@ -381,6 +396,60 @@ resource fork to preserve, and `DoOpen`'s `StandardGetFile` call uses
 `numTypes = -1` (no type filtering), so the file's type/creator don't matter
 for it to show up and open correctly.
 
+## Importing foreign files
+
+File → Import… (`DoImport` in `app.c`) opens `.rtf` files, and `.doc` files
+that turn out to actually be RTF content — a real, common case, since this
+app's own "Save As .doc" produces exactly that (see "Why .doc is actually
+RTF" below), and plenty of real-world `.doc` files in the wild are the same.
+The file is identified by **content, not name or extension**: the first
+bytes are checked for the RTF magic (`{\rtf`), so a `.doc` that's genuinely
+RTF opens correctly while one that isn't gets a clear rejection message
+instead of silently importing garbage. A `.docx` (ZIP magic `PK\3\4`) or
+genuine binary `.doc` (OLE2/CFB magic) is detected the same way and
+rejected with an explanation of why, rather than pretending to support it.
+Before the import actually runs, a warning explains that only text plus
+bold/italic/underline/font/size are recovered — this is genuinely a
+best-effort reader, not a full RTF implementation.
+
+`ReadDocumentFromRtf` (`src/rtf.c`) is a hand-rolled RTF tokenizer, not a
+parser for the whole spec — RTF's own design makes that a reasonable
+trade: an unrecognized control word is *supposed* to be silently ignored
+(that's the spec's own fallback rule), so a reader doesn't need to
+understand everything in order to safely skip past what it doesn't. What it
+does handle:
+
+- Plain text, `\b`/`\i`/`\ul`/`\ulnone`/`\plain`, `\fs` (size), `\par`/
+  `\line` (paragraph breaks), `\tab`.
+- **A real font table**: `{\fonttbl...}` is actually parsed (not skipped),
+  so a file's own `\fN` indices resolve to that file's *actual* font names
+  — necessary for opening real Word-authored RTF, where `\f0` might be
+  Calibri, not this app's own `\f0` = Times convention. Nested destinations
+  within a font's own sub-group (e.g. `{\*\panose ...}`, common in
+  Word-generated font tables) are correctly skipped without losing the rest
+  of that font's name — verified with a standalone test harness mirroring
+  the parser exactly, since this couldn't be tested live without an
+  emulator.
+- `\'hh` (literal hex-escaped byte) and `\uNNNN` (Unicode code point,
+  best-effort mapped back through `kMacRomanHigh`, falling back to `?`) —
+  including correctly skipping the `\ucN`-controlled fallback character(s)
+  that follow a `\u` escape per spec, so they don't leak into the text as
+  stray characters.
+- Non-text destinations are skipped by content, not by an exhaustive
+  keyword list: any `{\*...}` group is unconditionally skipped (that's
+  exactly what the `\*` marker means - "ignorable if unrecognized"), plus
+  an explicit list of common named destinations that don't use `\*`
+  (`colortbl`, `stylesheet`, `info`, `footnote`, `pict`, `object`,
+  `header`/`footer` variants, `generator`).
+
+What it deliberately does **not** attempt: paragraph alignment, lists/
+tables, embedded pictures/objects, and footnotes (the `\footnote` group is
+skipped rather than reconstructed as a real Quill footnote — recovering the
+anchor position correctly would need more bookkeeping than this pass
+covers). Imported content is treated as a new, unsaved document — `File →
+Save` offers Save As `.qdoc`, it does not silently overwrite the original
+`.rtf`/`.doc` file.
+
 ## Document size limit
 
 Classic TextEdit tracks every offset it deals with — `selStart`, `selEnd`,
@@ -488,11 +557,16 @@ necessary.
 
 ## Known limitations
 
-- **Open only reads `.qdoc`**: `.docx`/`.rtf`/`.doc` are write-only export
-  targets — reading real-world `.docx`/`.rtf`/binary `.doc` back would need a
-  full parser (plus, for `.docx`, a ZIP directory reader) for each format,
-  a much bigger lift than `.qdoc`'s reader, which only has to understand
-  its own output. Out of scope for this pass.
+- **Open only reads `.qdoc`**; `.docx`/`.rtf`/`.doc` remain write-only via
+  Save As. **Import (File → Import…) reads `.rtf`, and `.doc` files that are
+  actually RTF content** (as this app's own "Save As .doc" produces, and as
+  many real-world `.doc` files turn out to be) — see "Importing foreign
+  files" below for exactly what is/isn't recovered, and why genuine binary
+  `.doc` and `.docx` aren't handled (real `.docx` needs a from-scratch
+  DEFLATE decompressor to be useful at all, since Word always compresses its
+  ZIP entries — a large, error-prone undertaking deliberately deferred; real
+  binary `.doc` is OLE2/CFB, out of scope for the same reason described under
+  "Why .doc is actually RTF" below).
 - **No true superscript on-screen**: classic TextEdit's style byte has bits
   for bold/italic/underline/outline/shadow/condense/extend and nothing else
   — there's no baseline-shift or superscript concept at the Toolbox level.
