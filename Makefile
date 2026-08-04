@@ -20,6 +20,7 @@ all: configure
 	$(RETRO68)/bin/hformat -l "$(APP_NAME)" $(IMG)
 	$(RETRO68)/bin/hmount $(IMG)
 	$(RETRO68)/bin/hcopy -m $(BUILD_DIR)/$(APP_NAME).bin :$(APP_NAME)
+	$(RETRO68)/bin/hcopy -r "sample/Lorem Ipsum.qdoc" ":Lorem Ipsum.qdoc"
 	$(RETRO68)/bin/humount
 
 configure:

@@ -370,6 +370,17 @@ both this file — but it does mean a `.qdoc` file hand-edited into an
 unusual shape could confuse it. Malformed/foreign files are detected (missing
 `<quilldoc`/`<body>` tags) and rejected with an error rather than crashing.
 
+**A sample document** (`sample/Lorem Ipsum.qdoc`) is copied onto the disk
+image on every build (see the `Makefile`) so there's something to open via
+File → Open without having to type a whole document first. It's
+hand-written directly in the `.qdoc` XML shape described above, exercising
+Normal, Heading 1/2/3, and Quote formatting so the paragraph-style detection
+and menu checkmarks all have something real to react to. It's copied with
+`hcopy -r` (a raw byte copy, type `????`) rather than `-m` — there's no
+resource fork to preserve, and `DoOpen`'s `StandardGetFile` call uses
+`numTypes = -1` (no type filtering), so the file's type/creator don't matter
+for it to show up and open correctly.
+
 ## Document size limit
 
 Classic TextEdit tracks every offset it deals with — `selStart`, `selEnd`,
