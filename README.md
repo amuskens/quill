@@ -294,6 +294,42 @@ the Window Manager's standard (full-screen) state, followed by
 `ResizeDocumentWindow()` to re-lay-out the TE view and scrollbar for the new
 size — the same path a user clicking the zoom box triggers.
 
+**A second scrollbar gotcha, found once the SetPort fix above was tested**:
+the thumb worked, but the arrow/page buttons made the *entire window*
+visibly flash and didn't look like they were scrolling. Holding an arrow
+down repeatedly invokes `TrackControl`'s action proc (`ScrollAction`), many
+times a second for as long as the mouse stays down — and that callback used
+to end each tick by calling `ForceRedraw()`, which does `EraseRect` over the
+*whole window* before redrawing everything. Erasing and redrawing the whole
+window from scratch on every tick of a fast repeat is what was showing up
+as a flash, not a working scroll. The fix: `ScrollByPixels()` no longer
+calls `ForceRedraw()` at all — `TEPinScroll` already performs the on-screen
+scroll itself (shifting the existing bits and drawing only the newly
+revealed strip), and `UpdateScrollBarRange()`'s `SetControlValue` already
+redraws just the scrollbar control, so nothing was actually gained by the
+full-window erase on every tick. The `mouseDown` handler now calls
+`ForceRedraw()` exactly once, after `TrackControl` returns (i.e. once per
+click-and-hold or drag gesture, not once per tick) as a cheap settle pass
+for anything TEPinScroll's incremental redraw might have missed, like the
+grow icon.
+
+**Zoom and the scrollbar now cooperate on scroll position.** Before this,
+`RescaleDocument` left `destRect.top` at whatever raw pixel offset it was
+before the zoom, even though line heights (and therefore what that pixel
+offset actually points at) change with font size — reflowing to a
+*smaller* size could easily leave that stale offset pointing past the end
+of the now-shorter document, i.e. a blank window. `RescaleDocument` now
+captures the scroll position as a *fraction* of the scrollable range
+(`current offset / max scroll`) before rescaling, then re-derives the
+equivalent offset at the new size after `TECalText` re-lays-out the text,
+clamped into `[0, newMaxScroll]`. That clamp is what actually makes "can't
+go blank" true by construction — an offset within that range can never
+leave less than a viewHeight's worth of text below it — and there's a
+redundant belt-and-suspenders check right beside it that forces the offset
+back to 0 (top of document) if the new content height ever turns out
+smaller than the computed offset, since a blank document window is a much
+worse failure mode than one extra comparison.
+
 ## How .qdoc works
 
 `.qdoc` is a small custom XML dialect, documented in full in `native.c`'s

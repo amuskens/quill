@@ -290,7 +290,21 @@ static void UpdateScrollBarRange(void)
 }
 
 /* delta > 0 scrolls down (reveals later content); TEPinScroll clamps to the
-   valid range on its own, so callers don't need to. */
+   valid range on its own, so callers don't need to.
+
+   Deliberately does NOT call ForceRedraw(): TEPinScroll already performs
+   the on-screen scroll itself (shifting the existing bits and drawing only
+   the newly revealed strip), unlike ForceRedraw's EraseRect-then-redraw of
+   the *entire* window. That distinction matters here because ScrollAction
+   below calls this once per tick for as long as an arrow/page button is
+   held - erasing and redrawing the whole window on every tick, many times
+   a second, is what was producing a visible whole-window flash without
+   actually looking like it was scrolling. UpdateScrollBarRange's
+   SetControlValue/SetControlMaximum calls already redraw just the
+   scrollbar control on their own, which is enough - the caller does one
+   ForceRedraw() after the gesture (click or drag) completes, not per-tick,
+   to settle anything TEPinScroll's incremental redraw might have missed
+   (e.g. the grow icon). */
 static void ScrollByPixels(short delta)
 {
     if (delta == 0)
@@ -298,7 +312,6 @@ static void ScrollByPixels(short delta)
     SetPort(gDoc.window);
     TEPinScroll(0, -delta, gDoc.body);
     UpdateScrollBarRange();
-    ForceRedraw();
 }
 
 static pascal void ScrollAction(ControlHandle control, short part)
@@ -582,11 +595,27 @@ static void RescaleDocument(short newZoomPercent)
     GrafPtr port;
     INTEGER savedFont, savedSize;
     Style savedFace;
+    short viewHeight, oldMaxScroll, oldOffset, newMaxScroll, newOffset;
+    long oldTotalHeight, newTotalHeight;
 
     if (newZoomPercent == gZoomPercent)
         return;
 
     SetPort(gDoc.window);
+
+    /* Capture the current scroll position as a *fraction* of the
+       scrollable range before rescaling, so it can be restored
+       proportionally afterward - line heights change with font size, so
+       the raw pixel offset that was valid before reflow means something
+       different (or points past the end of a now-shorter document, which
+       is exactly the "screen goes blank" case) once TECalText re-lays-out
+       the text at the new size. */
+    viewHeight = (**gDoc.body).viewRect.bottom - (**gDoc.body).viewRect.top;
+    oldTotalHeight = TEGetHeight((**gDoc.body).nLines, 0, gDoc.body);
+    oldMaxScroll = (short)((oldTotalHeight > viewHeight) ? (oldTotalHeight - viewHeight) : 0);
+    oldOffset = (short)((**gDoc.body).viewRect.top - (**gDoc.body).destRect.top);
+    if (oldOffset < 0) oldOffset = 0;
+    if (oldOffset > oldMaxScroll) oldOffset = oldMaxScroll;
 
     /* TextFont/TextFace/TextSize below are only a means to feed GetFontInfo
        for each style table entry - they mutate the port's *ambient* text
@@ -661,6 +690,32 @@ static void RescaleDocument(short newZoomPercent)
 
     gZoomPercent = newZoomPercent;
     TECalText(gDoc.body);
+
+    /* Re-derive the proportional scroll position at the new size, then
+       clamp into [0, newMaxScroll]. That clamp is what actually guarantees
+       the view can't end up blank - destRect.top can never be pushed to
+       where less than a viewHeight's worth of text remains below it - not
+       a special case bolted on afterward. The extra newTotalHeight check
+       just below is belt-and-suspenders on top of that guarantee, since
+       the user-visible cost of being wrong here (a blank document window)
+       is much worse than the cost of a redundant check. */
+    newTotalHeight = TEGetHeight((**gDoc.body).nLines, 0, gDoc.body);
+    newMaxScroll = (short)((newTotalHeight > viewHeight) ? (newTotalHeight - viewHeight) : 0);
+    newOffset = (oldMaxScroll > 0)
+        ? (short)(((long)oldOffset * newMaxScroll + oldMaxScroll / 2) / oldMaxScroll)
+        : 0;
+    if (newOffset < 0) newOffset = 0;
+    if (newOffset > newMaxScroll) newOffset = newMaxScroll;
+    if (newTotalHeight <= newOffset)
+        newOffset = 0;
+
+    {
+        short newDestTop = (short)((**gDoc.body).viewRect.top - newOffset);
+        short destHeight = (**gDoc.body).destRect.bottom - (**gDoc.body).destRect.top;
+        (**gDoc.body).destRect.top = newDestTop;
+        (**gDoc.body).destRect.bottom = (short)(newDestTop + destHeight);
+    }
+
     UpdateScrollBarRange();
     ForceRedraw();
 }
@@ -1349,6 +1404,12 @@ void RunApp(void)
                                     } else {
                                         TrackControl(gVScrollBar, local, (ControlActionUPP)ScrollAction);
                                     }
+                                    /* One settle redraw after the whole
+                                       gesture (click-and-hold or drag)
+                                       completes, not per-tick - see
+                                       ScrollByPixels for why per-tick
+                                       redraws were removed. */
+                                    ForceRedraw();
                                 } else {
                                     Boolean isDoubleClick;
 
