@@ -192,7 +192,6 @@ static void CreateDocumentWindow(void)
 {
     Rect windBounds, viewRect, scrollRect;
     Str255 pname;
-    TextStyle ts;
 
     SetRect(&windBounds, 60, 60, 500, 380);
     gDoc.window = NewWindow(NULL, &windBounds, "\pUntitled", true,
@@ -206,17 +205,29 @@ static void CreateDocumentWindow(void)
 
     gVScrollBar = NewControl(gDoc.window, &scrollRect, "\p", true, 0, 0, 0, scrollBarProc, 0);
 
-    memset(&ts, 0, sizeof(ts));
     CToPascal(kFontNames[0], pname); /* Times, per product requirements */
     GetFNum(pname, &gBodyFontID);
-    ts.tsFont = gBodyFontID;
-    ts.tsSize = ScaleSize(kDefaultSize);
-    TESetStyle(doFont | doSize | doFace, &ts, false, gDoc.body);
 
     gDoc.haveFile = false;
     gDoc.format = kFormatQuill;
-    gDoc.dirty = false;
     gDoc.footnoteCount = 0;
+
+    /* Establish Normal (Times/12pt/plain) as the document's actual style,
+       through the same ApplyParaStyle path a user's "Normal" menu choice
+       uses - not a separately hand-set TESetStyle call that happens to
+       produce the same numbers. A brand-new document is never "unstyled
+       plain text" as a distinct third thing from Normal; it's Normal from
+       the first character, by construction. ApplyParaStyle marks the
+       document dirty, which is wrong for a just-created window, so that's
+       reset right after. */
+    ApplyParaStyle(pStyleNormal);
+    gDoc.dirty = false;
+
+    /* Start maximized: zoom to the Window Manager's standard (full-screen)
+       state, then re-lay-out TE/the scrollbar for the new size, same as a
+       user clicking the zoom box would trigger. */
+    ZoomWindow(gDoc.window, inZoomOut, true);
+    ResizeDocumentWindow();
 }
 
 /* Used after a grow-box drag resize or a zoom-box click: re-lays-out the TE
@@ -261,7 +272,11 @@ static void ForceRedraw(void)
    line count/wrapping (typing, paste, cut, style/size changes, zoom, etc). */
 static void UpdateScrollBarRange(void)
 {
-    short viewHeight = (**gDoc.body).viewRect.bottom - (**gDoc.body).viewRect.top;
+    short viewHeight;
+
+    SetPort(gDoc.window);
+
+    viewHeight = (**gDoc.body).viewRect.bottom - (**gDoc.body).viewRect.top;
     long totalHeight = TEGetHeight((**gDoc.body).nLines, 0, gDoc.body);
     short maxScroll = (short)((totalHeight > viewHeight) ? (totalHeight - viewHeight) : 0);
     short curOffset = (short)((**gDoc.body).viewRect.top - (**gDoc.body).destRect.top);
@@ -280,6 +295,7 @@ static void ScrollByPixels(short delta)
 {
     if (delta == 0)
         return;
+    SetPort(gDoc.window);
     TEPinScroll(0, -delta, gDoc.body);
     UpdateScrollBarRange();
     ForceRedraw();
@@ -314,22 +330,20 @@ static void ClearFootnotes(void)
 
 static void DoNew(void)
 {
-    TextStyle ts;
-
     TESetSelect(0, 32767, gDoc.body);
     TEDelete(gDoc.body);
     ClearFootnotes();
     gDoc.haveFile = false;
     gDoc.format = kFormatQuill;
-    gDoc.dirty = false;
     gZoomPercent = 100;
     gSizeWarningShown = false;
     TESetAlignment(teJustLeft, gDoc.body);
 
-    memset(&ts, 0, sizeof(ts));
-    ts.tsFont = gBodyFontID;
-    ts.tsSize = ScaleSize(kDefaultSize);
-    TESetStyle(doFont | doSize | doFace, &ts, false, gDoc.body);
+    /* Same reasoning as CreateDocumentWindow: route through ApplyParaStyle
+       so Normal is established via the one canonical definition, not a
+       separately hand-set TESetStyle call. */
+    ApplyParaStyle(pStyleNormal);
+    gDoc.dirty = false;
 
     TECalText(gDoc.body);
     UpdateScrollBarRange();
@@ -545,7 +559,18 @@ static short UnscaleSize(short actualSize)
    reshuffling, and doesn't touch the selection at all. The one thing not
    covered by the table is the "null style" (what the next *typed*
    character will use, relevant for a still-empty document or typing at the
-   very end) - that's rescaled the same way via its own separate struct. */
+   very end) - that's rescaled the same way via its own separate struct.
+
+   Each STElement/ScrpSTElement also caches stHeight/stAscent (and
+   scrpHeight/scrpAscent for the null style) - the line height and ascent
+   TextEdit measured for that style *when it was created*, used for the
+   caret and line layout. Changing stSize alone leaves those stale: the
+   glyphs themselves draw at the new size (drawing reads stSize directly),
+   but the caret is drawn using the old cached height, so it stops matching
+   the text - it stays whatever size it was before the zoom changed. Every
+   entry's height/ascent needs recomputing from the font's *actual* metrics
+   at its new size, the same way TESetStyle itself would when first
+   creating a style at that size. */
 static void RescaleDocument(short newZoomPercent)
 {
     TEStyleHandle sh;
@@ -554,9 +579,26 @@ static void RescaleDocument(short newZoomPercent)
     STElement *table;
     short nStyles, i;
     NullSTHandle nsh;
+    GrafPtr port;
+    INTEGER savedFont, savedSize;
+    Style savedFace;
 
     if (newZoomPercent == gZoomPercent)
         return;
+
+    SetPort(gDoc.window);
+
+    /* TextFont/TextFace/TextSize below are only a means to feed GetFontInfo
+       for each style table entry - they mutate the port's *ambient* text
+       state as a side effect, which has nothing to do with any entry's
+       stored formatting. Left unrestored, the port would come out of this
+       function with its ambient face set to whatever the last-processed
+       entry happened to be (often a heading's bold/italic combination),
+       which is stray state no caller expects. */
+    port = gDoc.window;
+    savedFont = port->txFont;
+    savedFace = port->txFace;
+    savedSize = port->txSize;
 
     sh = TEGetStyleHandle(gDoc.body);
     HLock((Handle)sh);
@@ -568,7 +610,16 @@ static void RescaleDocument(short newZoomPercent)
     HLock((Handle)tab);
     table = *tab;
     for (i = 0; i < nStyles; i++) {
+        FontInfo info;
+
         table[i].stSize = (short)(((long)table[i].stSize * newZoomPercent + gZoomPercent / 2) / gZoomPercent);
+
+        TextFont(table[i].stFont);
+        TextFace(table[i].stFace);
+        TextSize(table[i].stSize);
+        GetFontInfo(&info);
+        table[i].stAscent = info.ascent;
+        table[i].stHeight = (short)(info.ascent + info.descent + info.leading);
     }
     HUnlock((Handle)tab);
 
@@ -586,7 +637,16 @@ static void RescaleDocument(short newZoomPercent)
             scrap = *scrapH;
             if (scrap->scrpNStyles > 0) {
                 ScrpSTElement *e = &scrap->scrpStyleTab[0];
+                FontInfo info;
+
                 e->scrpSize = (short)(((long)e->scrpSize * newZoomPercent + gZoomPercent / 2) / gZoomPercent);
+
+                TextFont(e->scrpFont);
+                TextFace(e->scrpFace);
+                TextSize(e->scrpSize);
+                GetFontInfo(&info);
+                e->scrpAscent = info.ascent;
+                e->scrpHeight = (short)(info.ascent + info.descent + info.leading);
             }
             HUnlock((Handle)scrapH);
         }
@@ -594,6 +654,10 @@ static void RescaleDocument(short newZoomPercent)
     }
 
     HUnlock((Handle)sh);
+
+    TextFont(savedFont);
+    TextFace(savedFace);
+    TextSize(savedSize);
 
     gZoomPercent = newZoomPercent;
     TECalText(gDoc.body);
@@ -1266,6 +1330,12 @@ void RunApp(void)
                                 ControlHandle ctl;
                                 short ctlPart;
 
+                                /* GlobalToLocal converts relative to the
+                                   *current* port's origin - if a dialog
+                                   (Save/Open/Alert) left the port pointing
+                                   somewhere else, this would silently
+                                   mis-hit-test the scrollbar. */
+                                SetPort(whichWindow);
                                 GlobalToLocal(&local);
                                 ctlPart = FindControl(local, whichWindow, &ctl);
 

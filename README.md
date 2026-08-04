@@ -141,6 +141,17 @@ export), piggybacking on TextEdit's own tracking instead of duplicating it:
   selection touched, when you invoke the command — not dynamically
   renumbered if you later add/remove/reorder items (same tradeoff as
   footnote numbers).
+- **Normal is never a separate "unstyled" state.** Since paragraph style is
+  purely derived from a paragraph's own (size, bold, italic, underline) -
+  and Normal's entry in `kParaStyleSpecs` *is* `{12, false, false, false}` -
+  "plain Times/12pt text" and "Normal style" aren't two different things
+  that could drift apart; they're the same data by construction. New
+  documents and New/window creation get there by calling
+  `ApplyParaStyle(pStyleNormal)` (then immediately resetting the dirty flag
+  it sets, since a just-created document isn't unsaved) rather than a
+  separate hand-written `TESetStyle` call that happened to produce matching
+  numbers - so there's exactly one place that defines what "Normal" means,
+  and startup can't quietly drift from it.
 
 ## How zoom works
 
@@ -184,6 +195,21 @@ rather than only in the empty-document case the first version special-cased.
 window, so Format/Style/Align/Zoom checkmarks are correct before you've
 touched anything, not just after the first click.
 
+**A third gotcha, found after that fix**: the caret stopped matching the
+text size after zooming - it kept whatever size it was before the zoom
+changed, even though the surrounding glyphs correctly scaled. Each
+`STElement` (and the null style's `ScrpSTElement`) caches `stHeight`/
+`stAscent` (`scrpHeight`/`scrpAscent`) - the line height and ascent
+TextEdit measured for that exact font/face/size combination *when the
+style was created*. Glyph drawing reads `stSize` directly, so it always
+looked right; the caret and line layout use the cached height/ascent
+instead, which `RescaleDocument` was leaving untouched. The fix: after
+changing each entry's `stSize`, recompute its `stHeight`/`stAscent` from
+the font's actual metrics at the new size, the same way `TESetStyle` itself
+would - `TextFont`/`TextFace`/`TextSize` to point the current port at that
+exact style, then `GetFontInfo` to read back real `ascent`/`descent`/
+`leading` for it.
+
 Two consequences of the size-rewriting approach, both handled:
 
 - Style/size detection (menu checkmarks) compares against the size *as it
@@ -193,6 +219,24 @@ Two consequences of the size-rewriting approach, both handled:
   back** — so an exported `.docx`/`.rtf`/`.doc` always holds the true logical
   sizes (e.g. a real 12pt Heading) no matter what zoom you were looking at
   when you saved.
+
+**A fourth gotcha, also fixed:** the metrics-recomputation step needs to ask
+`GetFontInfo` for each style table entry's real ascent/descent/leading at its
+new size, which means pointing the current port at that entry's exact
+font/face/size first via `TextFont`/`TextFace`/`TextSize`. Those three calls
+mutate the port's *ambient* text state as a side effect — they have nothing
+to do with what gets stored in the style table, but if left unrestored, the
+port would come out of `RescaleDocument` with its ambient face set to
+whatever the last-processed entry happened to be (often a heading's
+bold/italic combination). `RescaleDocument` now saves the port's
+`txFont`/`txFace`/`txSize` before the metrics loop and restores them
+afterward, so zooming can't leave stray formatting state lying around.
+(Note: on a system where "Times" only has bitmap glyphs and not a TrueType
+outline, arbitrary zoom percentages can still land on point sizes the font
+has no hinted bitmap for, which QuickDraw then crudely scales from the
+nearest available size — this can look chunkier/heavier at a glance without
+any Bold style bit actually being set anywhere; it's a font-rendering
+artifact of the classic bitmap-font model, not a formatting bug.)
 
 ## The window chrome
 
@@ -229,6 +273,26 @@ this is the authentic default Control Manager behavior, not a shortcut.
 edit that could change line count or wrapping (typing, paste, style/size
 changes, zoom, window resize) so it can't fall out of sync with what's
 actually on screen.
+
+**Gotcha found after initial testing:** `GlobalToLocal` converts a point
+relative to the *current* GrafPort's origin, not necessarily the window being
+clicked in. Standard File dialogs (Save/Open) and alerts switch the current
+port to their own dialog port while they're up, and classic Mac OS doesn't
+guarantee it's restored the instant they close. If a click on the scrollbar
+happened to be the first thing the event loop saw after one of those, the
+coordinate conversion — and therefore `FindControl`'s hit test — would be
+computed against the wrong origin, so the click could silently miss the
+control and fall through to `TEClick` instead, making the scrollbar look
+inert. The `mouseDown`/`inContent` handler and `UpdateScrollBarRange()`/
+`ScrollByPixels()` now explicitly `SetPort(gDoc.window)` before doing any
+coordinate conversion or control update, the same defensive pattern
+`ForceRedraw()` and `RescaleDocument()` already followed.
+
+The document window now also starts maximized: at the end of
+`CreateDocumentWindow()`, `ZoomWindow(gDoc.window, inZoomOut, true)` zooms to
+the Window Manager's standard (full-screen) state, followed by
+`ResizeDocumentWindow()` to re-lay-out the TE view and scrollbar for the new
+size — the same path a user clicking the zoom box triggers.
 
 ## How .qdoc works
 
@@ -321,6 +385,20 @@ the app's own creator code, which `CMakeLists.txt` sets via
 `add_application(... CREATOR "Quil")` — without that match, Finder falls
 back to the generic application icon regardless of what icon resources
 exist in the file.
+
+**If Finder still shows the old icon after rebuilding:** this is almost
+always the Desktop Database, not a stale build. Finder/System 7 caches each
+creator code's icon the first time it sees a file with that signature, and
+won't re-read `BNDL`/`ICN#`/`icl4` from a rebuilt file with the *same*
+creator code on its own. Rebuilding the desktop database forces it to
+re-scan: hold down Command+Option while the Finder is starting up (or while
+inserting/mounting the disk image), and confirm the "rebuild the desktop
+file" prompt. This has been confirmed on this end — a freshly built
+`Quill.bin` genuinely contains the quill-pen `icl4`/`ICN#` data and the
+`Quil` creator/signature (checked directly against the built binary's
+bytes), so if the icon still looks wrong after a desktop rebuild, that would
+point at something else worth re-checking rather than the resource data
+itself.
 
 ## Known limitations
 
