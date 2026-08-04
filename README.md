@@ -330,6 +330,20 @@ back to 0 (top of document) if the new content height ever turns out
 smaller than the computed offset, since a blank document window is a much
 worse failure mode than one extra comparison.
 
+**Text was clipping behind the bottom chrome (grow icon).** `LayoutContent`
+computes the TE view rect by inset-ing the whole window's `portRect` by a
+flat 4px on every side, then separately pulling the *right* edge in further
+to stop clear of the vertical scrollbar (`viewRectOut->right =
+scrollRectOut->left - 1`) — but it never did the equivalent adjustment for
+the *bottom* edge against the grow icon, so text was free to render as far
+down as `portRect.bottom - 4`, well past where the scrollbar itself already
+stops 14px short (`scrollRectOut->bottom = r.bottom - 14`) to leave room for
+it. `LayoutContent` now applies that same "stop clear of the reserved
+chrome" adjustment to the bottom edge too
+(`viewRectOut->bottom = scrollRectOut->bottom - 1`), so the text view's
+bottom boundary is derived from the scrollbar's geometry instead of an
+independent flat inset that happened not to agree with it.
+
 ## How .qdoc works
 
 `.qdoc` is a small custom XML dialect, documented in full in `native.c`'s

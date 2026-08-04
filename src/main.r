@@ -201,7 +201,7 @@ resource 'DITL' (201) {
         Button { enabled, "OK" };
 
         { 10, 10, 90, 320 },
-        StaticText { enabled, "Quill\n\nA clean, modern-feeling word processor for classic Mac OS: rich text, paragraph styles, lists, footnotes, alignment, zoom, and .docx/.rtf/.doc export." };
+        StaticText { enabled, "Quill - A clean, modern-feeling word processor for classic Mac OS: rich text, paragraph styles, lists, footnotes, alignment, zoom, and .docx/.rtf/.doc export. Made by Anders Muskens" };
     }
 };
 

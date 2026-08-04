@@ -186,6 +186,12 @@ static void LayoutContent(Rect *viewRectOut, Rect *scrollRectOut)
     *viewRectOut = r;
     InsetRect(viewRectOut, 4, 4);
     viewRectOut->right = scrollRectOut->left - 1;
+    /* Same reasoning as the right edge above, just for the bottom: without
+       this, InsetRect's flat 4px leaves the text view extending to
+       r.bottom - 4, well past where scrollRectOut already stops (r.bottom
+       - 14) to leave room for the grow icon - so text could render behind
+       it instead of stopping clear of that reserved strip. */
+    viewRectOut->bottom = scrollRectOut->bottom - 1;
 }
 
 static void CreateDocumentWindow(void)
@@ -320,12 +326,19 @@ static pascal void ScrollAction(ControlHandle control, short part)
     short viewHeight = (**gDoc.body).viewRect.bottom - (**gDoc.body).viewRect.top;
     short delta = 0;
 
+    /* ScrollByPixels'/TEPinScroll's delta>0-scrolls-down convention is
+       confirmed correct by thumb-dragging (newValue - oldValue works
+       right there) - but empirically, wiring inUpButton/inPageUp to
+       negative deltas here scrolled *down*, and inDownButton/inPageDown
+       scrolled *up*: the opposite of what those part codes should mean.
+       Signs below are swapped from the "obvious" mapping to match what
+       actually happens on screen. */
     (void)control;
     switch (part) {
-        case inUpButton:   delta = (short)-lineHeight; break;
-        case inDownButton: delta = lineHeight; break;
-        case inPageUp:     delta = (short)-(viewHeight - lineHeight); break;
-        case inPageDown:   delta = (short)(viewHeight - lineHeight); break;
+        case inUpButton:   delta = lineHeight; break;
+        case inDownButton: delta = (short)-lineHeight; break;
+        case inPageUp:     delta = (short)(viewHeight - lineHeight); break;
+        case inPageDown:   delta = (short)-(viewHeight - lineHeight); break;
         default: return;
     }
     ScrollByPixels(delta);
