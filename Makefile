@@ -21,7 +21,8 @@ all: configure
 	$(RETRO68)/bin/hmount $(IMG)
 	$(RETRO68)/bin/hcopy -m $(BUILD_DIR)/$(APP_NAME).bin :$(APP_NAME)
 	$(RETRO68)/bin/hcopy -r "sample/Lorem Ipsum.qdoc" ":Lorem Ipsum.qdoc"
-	$(RETRO68)/bin/hcopy -r "sample/Lorem Ipsum.docx" ":Lorem Ipsum.docx"
+	$(RETRO68)/bin/hcopy -r "sample/Lorem Ipsum.rtf" ":Lorem Ipsum.rtf"
+	$(RETRO68)/bin/hcopy -r "sample/Lorem Ipsum.doc" ":Lorem Ipsum.doc"
 	$(RETRO68)/bin/humount
 
 configure:
