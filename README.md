@@ -386,19 +386,44 @@ the app's own creator code, which `CMakeLists.txt` sets via
 back to the generic application icon regardless of what icon resources
 exist in the file.
 
-**If Finder still shows the old icon after rebuilding:** this is almost
-always the Desktop Database, not a stale build. Finder/System 7 caches each
-creator code's icon the first time it sees a file with that signature, and
-won't re-read `BNDL`/`ICN#`/`icl4` from a rebuilt file with the *same*
-creator code on its own. Rebuilding the desktop database forces it to
-re-scan: hold down Command+Option while the Finder is starting up (or while
-inserting/mounting the disk image), and confirm the "rebuild the desktop
-file" prompt. This has been confirmed on this end — a freshly built
-`Quill.bin` genuinely contains the quill-pen `icl4`/`ICN#` data and the
-`Quil` creator/signature (checked directly against the built binary's
-bytes), so if the icon still looks wrong after a desktop rebuild, that would
-point at something else worth re-checking rather than the resource data
-itself.
+**Why Finder wasn't showing the icon at all (found and fixed):** it turned
+out to have nothing to do with the icon data itself, or with Finder's
+Desktop Database caching an old association - the copied file was missing
+the Finder "has bundle" flag (`0x2000`) entirely, on every build, so Finder
+had no reason to ever look at its `BNDL`/`ICN#`/`icl4` resources in the
+first place. Two things combine to cause this:
+
+1. Retro68's `Rez` tool writes `Quill.bin` in MacBinary format, and its
+   writer (`ResourceFiles/ResourceFile.cc`) hard-codes the header's
+   Finder-flags byte to `0` unconditionally - it has no logic to notice a
+   `BNDL` resource exists and turn the bundle bit on for it.
+2. `hcopy -m` (used to put the app onto the `.img` floppy image) carries
+   that byte straight from the MacBinary header into the copied file's HFS
+   catalog entry, unmodified (`hfsutils/copyin.c`'s `cpi_macb`).
+
+So every build produced a file whose icon resources were all correct, but
+whose Finder Info said "no bundle here" - which reads to Finder exactly
+like an app with no custom icon at all, every single time, not an
+occasionally-stale cache.
+
+The fix (`tools/set_bundle_bit.py`, run from the `Makefile` right after
+`Quill.bin` is generated and before `hcopy -m`) patches that bit directly
+into the MacBinary header before the file is copied onto the disk image.
+The header also carries a CRC-16 checksum that `hcopy -m` verifies before
+accepting the file, so the script recomputes that too using the same
+lookup table Rez's writer and `hcopy`'s checker both use (transcribed
+directly from `ResourceFile.cc`, not reconstructed from the general
+algorithm, so it's guaranteed to agree with both sides bit-for-bit). Verified
+by round-tripping the file back out of a freshly built disk image
+(`hcopy -m :Quill out.bin`) and confirming its Finder flags read back as
+`0x2000`, not just checking the pre-copy `.bin`.
+
+If, after all that, Finder *still* shows a stale icon for a file it already
+saw under the old (bundle-less) state, that would be the Desktop Database
+caching its earlier "no custom icon" verdict - Command+Option at Finder
+startup (or disk mount) and confirming "rebuild the desktop file" clears
+that. But for a disk image built fresh with this fix, that shouldn't be
+necessary.
 
 ## Known limitations
 

@@ -10,6 +10,11 @@ IMG_BLOCKS := 1440 # 1440 * 1024 = 1,474,560 bytes: a standard HD 3.5" floppy
 
 all: configure
 	cmake --build $(BUILD_DIR)
+	@# See tools/set_bundle_bit.py: Rez's MacBinary writer always emits a
+	@# zeroed Finder-flags byte, so without this, Finder never looks at
+	@# this file's BNDL/icon resources at all - not a caching artifact,
+	@# a permanently-missing bit.
+	python3 tools/set_bundle_bit.py $(BUILD_DIR)/$(APP_NAME).bin
 	rm -f $(IMG)
 	dd if=/dev/zero of=$(IMG) bs=1024 count=$(IMG_BLOCKS) status=none
 	$(RETRO68)/bin/hformat -l "$(APP_NAME)" $(IMG)
