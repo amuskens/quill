@@ -66,6 +66,7 @@ typedef enum {
     pStyleNormal = 0,
     pStyleHeading1, pStyleHeading2, pStyleHeading3, pStyleHeading4,
     pStyleQuote, pStyleBibliography,
+    pStylePlainText,
     kParaStyleCount
 } ParaStyleKind;
 
@@ -74,41 +75,53 @@ typedef struct {
     Boolean bold;
     Boolean italic;
     Boolean underline;
+    /* true = classic TextEdit's own default font (systemFont, i.e. Chicago -
+       whatever a brand-new, never-styled TE record would show), not this
+       app's body font (Times). Only Plain Text uses this - everything else
+       is explicitly the app's Times-based styling. This exists so "Plain
+       Text" and "Normal" are genuinely distinguishable: without it they'd
+       share the exact same (size,bold,italic,underline) triple and collapse
+       into one indistinguishable style, the same way Heading 2 and Quote
+       used to before Heading 2 picked up bold (see below). */
+    Boolean systemFont;
 } ParaStyleSpec;
 
-/* NOTE: Heading 2 and Quote are intentionally identical here (12pt, italic,
-   not bold, not underlined) - a deliberate choice, not an oversight. Since
-   paragraph style is recognized by matching this exact (size,bold,italic,
-   underline) combination (see the comment above), the two are genuinely
-   indistinguishable: applying Quote will show/export as Heading 2. */
+/* Heading 2 and Quote used to be fully identical (12pt italic, not bold) -
+   not anymore: Heading 2 is now bold+italic, so bold alone tells them apart.
+   Kept as a reference for why DetectParaStyle's matching logic has to
+   compare every field, not just size - two styles differing in only one
+   dimension (bold, or now systemFont for Plain Text vs Normal) still need
+   to be distinguishable. */
 static const ParaStyleSpec kParaStyleSpecs[kParaStyleCount] = {
-    {12, false, false, false}, /* Normal */
-    {14, true, false, false}, /* Heading 1 */
-    {12, true, true,  false}, /* Heading 2 */
-    {12, true, false, true},  /* Heading 3 */
-    {12, false, true,  true},  /* Heading 4 */
-    {12, false, true,  false}, /* Quote - same combo as Heading 2, see note above */
-    {10, false, false, false}  /* Bibliography */
+    {12, false, false, false, false}, /* Normal */
+    {14, true,  false, false, false}, /* Heading 1 */
+    {12, true,  true,  false, false}, /* Heading 2 */
+    {12, true,  false, true,  false}, /* Heading 3 */
+    {12, false, true,  true,  false}, /* Heading 4 */
+    {12, false, true,  false, false}, /* Quote */
+    {10, false, false, false, false}, /* Bibliography */
+    {12, false, false, false, true }, /* Plain Text - systemFont, not Times */
 };
 
 /* docx w:styleId values (no spaces; Heading1-4 match Word's own built-in IDs) */
 static const char *kParaStyleIds[kParaStyleCount] = {
-    "Normal", "Heading1", "Heading2", "Heading3", "Heading4", "Quote", "Bibliography"
+    "Normal", "Heading1", "Heading2", "Heading3", "Heading4", "Quote", "Bibliography", "PlainText"
 };
 
 /* docx w:name values (Word's own display names for heading 1-4) */
 static const char *kParaStyleNames[kParaStyleCount] = {
-    "Normal", "heading 1", "heading 2", "heading 3", "heading 4", "Quote", "Bibliography"
+    "Normal", "heading 1", "heading 2", "heading 3", "heading 4", "Quote", "Bibliography", "Plain Text"
 };
 
-static ParaStyleKind DetectParaStyle(short size, Boolean bold, Boolean italic, Boolean underline)
+static ParaStyleKind DetectParaStyle(short size, Boolean bold, Boolean italic, Boolean underline, Boolean systemFont)
 {
     short i;
     for (i = 1; i < kParaStyleCount; i++) {
         if (kParaStyleSpecs[i].size == size &&
             kParaStyleSpecs[i].bold == bold &&
             kParaStyleSpecs[i].italic == italic &&
-            kParaStyleSpecs[i].underline == underline)
+            kParaStyleSpecs[i].underline == underline &&
+            kParaStyleSpecs[i].systemFont == systemFont)
             return (ParaStyleKind)i;
     }
     return pStyleNormal;

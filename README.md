@@ -13,19 +13,20 @@ on 68k System 7 (or Mini vMac).
 - **Format menu**: Bold/Italic/Underline toggles, a fixed set of common Mac
   fonts (Times, Geneva, New York, Helvetica, Courier, Monaco, Palatino), and
   point sizes (9–24). Checkmarks reflect the style at the current selection.
-- **Style menu**: paragraph styles — Normal, Heading 1–4, Quote, Bibliography
-  — plus Bullet List / Numbered List toggles. Always the default font
-  (Times); size/face per style: Normal 12pt plain, Heading 1 14pt plain,
-  Heading 2 12pt italic, Heading 3 12pt underlined, Heading 4 12pt
-  italic+underlined, Quote 12pt italic, Bibliography 10pt plain. **Heading 2
-  and Quote are identical** (12pt italic) — a deliberate choice, not a bug;
-  see "How paragraph styles/lists work" below for what that means in
-  practice. Applying a style **leaves the affected paragraph(s) selected**
-  so the change is immediately visible. Bullet/Numbered
-  List items continue onto the next line when you press Return, like Word —
-  pressing Return again on an empty item exits the list instead of adding
-  another marker. See "How paragraph styles/lists work" below for how this
-  maps onto exported files.
+- **Style menu**: paragraph styles — Normal, Heading 1–4, Quote, Bibliography,
+  Plain Text — plus Bullet List / Numbered List toggles. Size/face per style:
+  Normal 12pt plain, Heading 1 14pt bold, Heading 2 12pt bold+italic,
+  Heading 3 12pt bold+underlined, Heading 4 12pt italic+underlined, Quote
+  12pt italic, Bibliography 10pt plain, Plain Text 12pt plain. Every style
+  uses the app's body font (Times) **except Plain Text**, which deliberately
+  uses classic TextEdit's own default font instead — see "How paragraph
+  styles/lists work" below for why that distinction needed adding to the
+  style-matching logic itself, not just the menu. Applying a style **leaves
+  the affected paragraph(s) selected** so the change is immediately visible.
+  Bullet/Numbered List items continue onto the next line when you press
+  Return, like Word — pressing Return again on an empty item exits the list
+  instead of adding another marker. See "How paragraph styles/lists work"
+  below for how this maps onto exported files.
 - **Align menu**: Left / Center / Right / Justify, applied to the whole
   document — the menu itself says so (a permanently-disabled "Whole
   Document:" label heads the menu) since classic TextEdit alignment isn't
@@ -121,17 +122,29 @@ via its style-run table — so paragraph style and list membership are instead
 **derived from content each time they're needed** (screen-checkmark refresh,
 export), piggybacking on TextEdit's own tracking instead of duplicating it:
 
-- **Paragraph style** (Heading 1–4 / Quote / Bibliography) is recognized by
-  matching a paragraph's own (size, bold, italic, underline) against a fixed
-  table (`kParaStyleSpecs` in `wordproc.h`) — the same combination "Apply
-  Style" itself sets. Most styles share 12pt, so face is often the only
-  distinguishing signal — manually italicizing plain 12pt text, for
-  instance, would be misidentified as Heading 2/Quote. **Heading 2 and
-  Quote are fully identical** (12pt, italic, not bold, not underlined) by
-  explicit choice, so they're not just collision-prone but genuinely
-  indistinguishable: applying Quote will show up checked as Heading 2 in
-  the Style menu, and export with `w:pStyle val="Heading2"`, not Quote.
-  Documented tradeoff, not a bug.
+- **Paragraph style** (Heading 1–4 / Quote / Bibliography / Plain Text) is
+  recognized by matching a paragraph's own (size, bold, italic, underline,
+  and — for Plain Text specifically — font) against a fixed table
+  (`kParaStyleSpecs` in `wordproc.h`) — the same combination "Apply Style"
+  itself sets. Most styles share 12pt, so face is often the only
+  distinguishing signal — manually italicizing plain 12pt Times text, for
+  instance, would be misidentified as Quote (Heading 2 also being bold now
+  rules it out specifically). Heading 2 and Quote used to be **fully
+  identical** (12pt, italic, not bold, not underlined) by explicit choice;
+  that changed when Heading 2 picked up bold, so bold alone now tells them
+  apart — kept as a documented example of why every field has to be
+  compared, not just size, rather than as a still-current limitation.
+- **Plain Text vs. Normal** is a similar case, solved the same way: both are
+  12pt/plain/plain/plain, so (size, bold, italic, underline) alone can't
+  distinguish them — they'd collapse into one indistinguishable style just
+  like Heading 2/Quote used to. `DetectParaStyle` and `ParaStyleSpec` both
+  gained a `systemFont` field for exactly this: Plain Text is classic
+  TextEdit's own default font (`systemFont`, i.e. Chicago — whatever a
+  brand-new, never-explicitly-styled TE record would show), Normal and
+  every other style use the app's body font (Times). `ApplyParaStyle` sets
+  `ts.tsFont` from that flag; the Style-menu checkmark logic
+  (`AdjustMenus`) now checks `doFont` continuity too, not just face/size,
+  so it can tell which one is actually selected.
 - **List membership** is recognized by a literal `"• "` or `"<digits>. "`
   prefix at the paragraph's start, inserted by the Bullet/Numbered List
   commands. On `.docx` export, that literal prefix is *stripped* and replaced
@@ -143,17 +156,21 @@ export), piggybacking on TextEdit's own tracking instead of duplicating it:
   selection touched, when you invoke the command — not dynamically
   renumbered if you later add/remove/reorder items (same tradeoff as
   footnote numbers).
-- **Normal is never a separate "unstyled" state.** Since paragraph style is
-  purely derived from a paragraph's own (size, bold, italic, underline) -
-  and Normal's entry in `kParaStyleSpecs` *is* `{12, false, false, false}` -
-  "plain Times/12pt text" and "Normal style" aren't two different things
-  that could drift apart; they're the same data by construction. New
-  documents and New/window creation get there by calling
-  `ApplyParaStyle(pStyleNormal)` (then immediately resetting the dirty flag
-  it sets, since a just-created document isn't unsaved) rather than a
-  separate hand-written `TESetStyle` call that happened to produce matching
-  numbers - so there's exactly one place that defines what "Normal" means,
-  and startup can't quietly drift from it.
+- **Normal is never an accidental "unstyled" state** — but Plain Text is a
+  deliberate one. Since paragraph style is purely derived from a paragraph's
+  own (size, bold, italic, underline, font), and Normal's entry in
+  `kParaStyleSpecs` *is* `{12, false, false, false, Times}`, "app-default
+  Times/12pt text" and "Normal style" aren't two different things that could
+  drift apart; they're the same data by construction. New documents and
+  New/window creation get there by calling `ApplyParaStyle(pStyleNormal)`
+  (then immediately resetting the dirty flag it sets, since a just-created
+  document isn't unsaved) rather than a separate hand-written `TESetStyle`
+  call that happened to produce matching numbers - so there's exactly one
+  place that defines what "Normal" means, and startup can't quietly drift
+  from it. Plain Text exists as the *other* thing: genuine classic TextEdit
+  default formatting, available from the Style menu like any other style,
+  for when Times-by-default isn't wanted for a particular paragraph -
+  without being what a new document silently starts as.
 
   **Gotcha**: when "start maximized" was added to `CreateDocumentWindow`
   (see "The window chrome" below), `ApplyParaStyle(pStyleNormal)` was still
@@ -395,6 +412,20 @@ and menu checkmarks all have something real to react to. It's copied with
 resource fork to preserve, and `DoOpen`'s `StandardGetFile` call uses
 `numTypes = -1` (no type filtering), so the file's type/creator don't matter
 for it to show up and open correctly.
+
+**A matching `.docx` sample** (`sample/Lorem Ipsum.docx`) is copied onto the
+disk image the same way, for testing what Quill's export format looks like
+in real Word/Pages/LibreOffice - same Lorem Ipsum text and heading/quote
+formatting as the `.qdoc` sample, so the two are directly comparable. It's
+*not* produced by running `docx.c` itself (there's no way to invoke 68k
+code host-side) - `tools/gen_sample_docx.py` builds a standard, valid OOXML
+package with Python's `zipfile` module directly, matching docx.c's
+content/formatting intent rather than being a byte-identical replica of its
+serialization. Verified well-formed (each XML part parses, the zip's own
+integrity check passes) and confirmed to round-trip byte-for-byte off a
+freshly built disk image before being added to the `Makefile`. Quill itself
+can't open `.docx` back (see "Importing foreign files" below for why) - this
+file is for external verification, not for testing Open/Import.
 
 ## Importing foreign files
 

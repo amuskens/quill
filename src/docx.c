@@ -321,7 +321,8 @@ static void BuildDocumentXml(Document *doc, DynBuf *out)
         styleKind = DetectParaStyle(runs[runIdx].size,
                                      (Boolean)((runs[runIdx].face & bold) != 0),
                                      (Boolean)((runs[runIdx].face & italic) != 0),
-                                     (Boolean)((runs[runIdx].face & underline) != 0));
+                                     (Boolean)((runs[runIdx].face & underline) != 0),
+                                     (Boolean)(runs[runIdx].font == systemFont));
 
         DBAppendStr(out, "<w:p>");
         EmitParagraphProps(out, styleKind, listKind, alignWord);

@@ -122,6 +122,7 @@ resource 'MENU' (133, preload) {
         "Heading 4", noIcon, noKey, noMark, plain;
         "Quote", noIcon, noKey, noMark, plain;
         "Bibliography", noIcon, noKey, noMark, plain;
+        "Plain Text", noIcon, noKey, noMark, plain;
         "-", noIcon, noKey, noMark, plain;
         "Bullet List", noIcon, noKey, noMark, plain;
         "Numbered List", noIcon, noKey, noMark, plain;

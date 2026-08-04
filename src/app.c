@@ -41,8 +41,10 @@ enum {
 enum { iInsertFootnote = 1 };
 
 /* Style menu: items 1..kParaStyleCount map directly to ParaStyleKind 0..N-1;
-   item kParaStyleCount+1 is a divider. */
-enum { iBulletList = 9, iNumberedList = 10 };
+   item kParaStyleCount+1 is a divider. Derived from kParaStyleCount rather
+   than hardcoded so adding/removing a style can't silently desync these
+   from the actual menu layout in main.r. */
+enum { iBulletList = kParaStyleCount + 2, iNumberedList = kParaStyleCount + 3 };
 
 /* item 1 is the permanently-disabled "Whole Document:" label - see SetupMenus */
 enum { iAlignLeft = 2, iAlignCenter = 3, iAlignRight = 4, iAlignJustify = 5 };
@@ -1026,9 +1028,11 @@ static short CollectTouchedParagraphs(long selStart, long selEnd, long *starts, 
     return count;
 }
 
-/* Every paragraph style uses the default font (Times) and 12pt; only the
-   face bits differ (see wordproc.h). Applying a style leaves the affected
-   paragraph(s) selected so the change is immediately visible. */
+/* Every paragraph style uses the app's body font (Times) except Plain Text,
+   which deliberately uses classic TextEdit's own default (systemFont) - see
+   wordproc.h's ParaStyleSpec.systemFont comment for why that distinction
+   exists. Applying a style leaves the affected paragraph(s) selected so the
+   change is immediately visible. */
 static void ApplyParaStyle(ParaStyleKind kind)
 {
     long rangeStart, rangeEnd;
@@ -1038,7 +1042,7 @@ static void ApplyParaStyle(ParaStyleKind kind)
     TESetSelect(rangeStart, rangeEnd, gDoc.body);
 
     memset(&ts, 0, sizeof(ts));
-    ts.tsFont = gBodyFontID;
+    ts.tsFont = kParaStyleSpecs[kind].systemFont ? systemFont : gBodyFontID;
     ts.tsSize = ScaleSize(kParaStyleSpecs[kind].size);
     ts.tsFace = 0;
     if (kParaStyleSpecs[kind].bold) ts.tsFace |= bold;
@@ -1248,13 +1252,14 @@ static void AdjustMenus(void)
 
         GetParagraphRange((**gDoc.body).selStart, &pStart, &pEnd);
 
-        mode2 = doFace | doSize;
+        mode2 = doFace | doSize | doFont;
         cont2 = TEContinuousStyle(&mode2, &ts2, gDoc.body);
         kind = cont2
                    ? DetectParaStyle(UnscaleSize(ts2.tsSize),
                                       (Boolean)((ts2.tsFace & bold) != 0),
                                       (Boolean)((ts2.tsFace & italic) != 0),
-                                      (Boolean)((ts2.tsFace & underline) != 0))
+                                      (Boolean)((ts2.tsFace & underline) != 0),
+                                      (Boolean)(ts2.tsFont == systemFont))
                    : pStyleNormal;
 
         for (k = 0; k < kParaStyleCount; k++)
