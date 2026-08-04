@@ -58,6 +58,8 @@ enum { iAlignLeft = 2, iAlignCenter = 3, iAlignRight = 4, iAlignJustify = 5 };
 #define kDoubleClickTicks 30 /* ~0.5s at 60 ticks/sec; GetDblTime() isn't available for this target */
 #define kMaxTouchedParagraphs 200
 #define kEnterKey         0x03 /* numeric-keypad Enter; treated the same as Return */
+#define kScrollBarWidth   16
+#define kZoomDocProc      8  /* zoomDocProc - a Rez-only named constant in this toolchain's headers, not exposed to C */
 
 /* Classic TextEdit tracks every offset (selStart/selEnd/teLength/lineStarts/
    StyleRun.startChar) as a 16-bit signed INTEGER, so ~32,767 characters is a
@@ -75,6 +77,7 @@ static const short kZoomLevels[] = { 50, 100, 150, 200, 300, 400 };
 static Document gDoc;
 static Boolean gDone = false;
 static MenuHandle gAppleMenu, gFileMenu, gEditMenu, gFormatMenu, gInsertMenu, gStyleMenu, gAlignMenu, gZoomMenu;
+static ControlHandle gVScrollBar;
 static short gBodyFontID;
 static short gZoomPercent = 100;
 static unsigned long gLastClickTime = 0;
@@ -84,8 +87,12 @@ static Boolean gSizeWarningShown = false;
 static void ToolboxInit(void);
 static void SetupMenus(void);
 static void CreateDocumentWindow(void);
+static void LayoutContent(Rect *viewRectOut, Rect *scrollRectOut);
 static void ResizeDocumentWindow(void);
 static void ForceRedraw(void);
+static void UpdateScrollBarRange(void);
+static void ScrollByPixels(short delta);
+static pascal void ScrollAction(ControlHandle control, short part);
 static void HandleMenuChoice(long menuChoice);
 static void HandleFileMenu(short item);
 static void HandleEditMenu(short item);
@@ -161,22 +168,43 @@ static void SetupMenus(void)
     DrawMenuBar();
 }
 
+/* Splits the window's content area into the TE view (left/top/bottom
+   inset 4px, right edge stopping short of the scrollbar) and the vertical
+   scrollbar's own rect (a kScrollBarWidth strip down the right edge,
+   overlapping the window frame by 1px on each side per classic Mac
+   convention, stopping 14px short of the bottom to leave room for the
+   grow icon). Shared by window creation and every resize/zoom. */
+static void LayoutContent(Rect *viewRectOut, Rect *scrollRectOut)
+{
+    Rect r = gDoc.window->portRect;
+
+    scrollRectOut->top = r.top - 1;
+    scrollRectOut->left = r.right - kScrollBarWidth;
+    scrollRectOut->bottom = r.bottom - 14;
+    scrollRectOut->right = r.right + 1;
+
+    *viewRectOut = r;
+    InsetRect(viewRectOut, 4, 4);
+    viewRectOut->right = scrollRectOut->left - 1;
+}
+
 static void CreateDocumentWindow(void)
 {
-    Rect windBounds, viewRect;
+    Rect windBounds, viewRect, scrollRect;
     Str255 pname;
     TextStyle ts;
 
     SetRect(&windBounds, 60, 60, 500, 380);
     gDoc.window = NewWindow(NULL, &windBounds, "\pUntitled", true,
-                             documentProc, (WindowPtr)-1L, true, 0);
+                             kZoomDocProc, (WindowPtr)-1L, true, 0);
     SetPort(gDoc.window);
 
-    viewRect = gDoc.window->portRect;
-    InsetRect(&viewRect, 4, 4);
+    LayoutContent(&viewRect, &scrollRect);
 
     gDoc.body = TEStyleNew(&viewRect, &viewRect);
     TEAutoView(true, gDoc.body);
+
+    gVScrollBar = NewControl(gDoc.window, &scrollRect, "\p", true, 0, 0, 0, scrollBarProc, 0);
 
     memset(&ts, 0, sizeof(ts));
     CToPascal(kFontNames[0], pname); /* Times, per product requirements */
@@ -186,31 +214,92 @@ static void CreateDocumentWindow(void)
     TESetStyle(doFont | doSize | doFace, &ts, false, gDoc.body);
 
     gDoc.haveFile = false;
-    gDoc.format = kFormatDocx;
+    gDoc.format = kFormatQuill;
     gDoc.dirty = false;
     gDoc.footnoteCount = 0;
 }
 
+/* Used after a grow-box drag resize or a zoom-box click: re-lays-out the TE
+   view and the scrollbar for the window's current size. */
 static void ResizeDocumentWindow(void)
 {
-    Rect viewRect = gDoc.window->portRect;
-    InsetRect(&viewRect, 4, 4);
+    Rect viewRect, scrollRect;
+
+    LayoutContent(&viewRect, &scrollRect);
+
     (**gDoc.body).destRect = viewRect;
     (**gDoc.body).viewRect = viewRect;
     TECalText(gDoc.body);
+
+    MoveControl(gVScrollBar, scrollRect.left, scrollRect.top);
+    SizeControl(gVScrollBar, scrollRect.right - scrollRect.left, scrollRect.bottom - scrollRect.top);
+
+    UpdateScrollBarRange();
     ForceRedraw();
 }
 
 /* Synchronously repaints the document window right now, instead of just
    invalidating and waiting for the next update event - used after actions
-   (zoom, alignment, New) whose whole point is visible-immediately feedback,
-   since InvalRect only *schedules* a redraw for whenever the event loop
-   next gets around to it. */
+   (zoom, alignment, New, resize) whose whole point is visible-immediately
+   feedback, since InvalRect only *schedules* a redraw for whenever the
+   event loop next gets around to it. */
 static void ForceRedraw(void)
 {
     SetPort(gDoc.window);
     EraseRect(&gDoc.window->portRect);
     TEUpdate(&gDoc.window->portRect, gDoc.body);
+    DrawControls(gDoc.window);
+    DrawGrowIcon(gDoc.window);
+}
+
+/* Keeps the scrollbar's min/max/value in sync with the document's actual
+   content height and current scroll position. TE implements scrolling by
+   shifting destRect relative to a fixed viewRect, so the current scroll
+   offset in pixels is simply how far destRect.top has moved above
+   viewRect.top; TEGetHeight gives the total content height to compare
+   against the visible height. Called after every edit that could change
+   line count/wrapping (typing, paste, cut, style/size changes, zoom, etc). */
+static void UpdateScrollBarRange(void)
+{
+    short viewHeight = (**gDoc.body).viewRect.bottom - (**gDoc.body).viewRect.top;
+    long totalHeight = TEGetHeight((**gDoc.body).nLines, 0, gDoc.body);
+    short maxScroll = (short)((totalHeight > viewHeight) ? (totalHeight - viewHeight) : 0);
+    short curOffset = (short)((**gDoc.body).viewRect.top - (**gDoc.body).destRect.top);
+
+    if (curOffset > maxScroll) curOffset = maxScroll;
+    if (curOffset < 0) curOffset = 0;
+
+    SetControlMinimum(gVScrollBar, 0);
+    SetControlMaximum(gVScrollBar, maxScroll);
+    SetControlValue(gVScrollBar, curOffset);
+}
+
+/* delta > 0 scrolls down (reveals later content); TEPinScroll clamps to the
+   valid range on its own, so callers don't need to. */
+static void ScrollByPixels(short delta)
+{
+    if (delta == 0)
+        return;
+    TEPinScroll(0, -delta, gDoc.body);
+    UpdateScrollBarRange();
+    ForceRedraw();
+}
+
+static pascal void ScrollAction(ControlHandle control, short part)
+{
+    short lineHeight = (**gDoc.body).lineHeight;
+    short viewHeight = (**gDoc.body).viewRect.bottom - (**gDoc.body).viewRect.top;
+    short delta = 0;
+
+    (void)control;
+    switch (part) {
+        case inUpButton:   delta = (short)-lineHeight; break;
+        case inDownButton: delta = lineHeight; break;
+        case inPageUp:     delta = (short)-(viewHeight - lineHeight); break;
+        case inPageDown:   delta = (short)(viewHeight - lineHeight); break;
+        default: return;
+    }
+    ScrollByPixels(delta);
 }
 
 static void ClearFootnotes(void)
@@ -231,7 +320,7 @@ static void DoNew(void)
     TEDelete(gDoc.body);
     ClearFootnotes();
     gDoc.haveFile = false;
-    gDoc.format = kFormatDocx;
+    gDoc.format = kFormatQuill;
     gDoc.dirty = false;
     gZoomPercent = 100;
     gSizeWarningShown = false;
@@ -243,6 +332,7 @@ static void DoNew(void)
     TESetStyle(doFont | doSize | doFace, &ts, false, gDoc.body);
 
     TECalText(gDoc.body);
+    UpdateScrollBarRange();
     ForceRedraw();
     SetWTitle(gDoc.window, "\pUntitled");
 }
@@ -295,12 +385,16 @@ static Boolean DoSaveAs(SaveFormat fmt)
     return true;
 }
 
+/* Plain Save (Cmd-S) on a document with no file yet defaults to .qdoc, not
+   an export format - dedicated "Save As .docx/.rtf/.doc" menu items exist
+   for when an export format is specifically wanted, so the bare/default
+   Save should use Quill's own native, fully round-trippable format. */
 static void DoSave(void)
 {
     OSErr err;
 
     if (!gDoc.haveFile) {
-        DoSaveAs(kFormatDocx);
+        DoSaveAs(kFormatQuill);
         return;
     }
 
@@ -315,15 +409,16 @@ static void DoSave(void)
 
 /* Used by ConfirmDiscardChanges's "Save" button: saves in place if the
    document already has a file (in whatever format it was last saved as),
-   otherwise falls through to a Save As (defaulting to .docx). Returns false
-   if nothing actually got saved - either a write error or the user
-   cancelled the Save As dialog - so the caller knows NOT to discard. */
+   otherwise falls through to a Save As .qdoc (see DoSave's comment).
+   Returns false if nothing actually got saved - either a write error or
+   the user cancelled the Save As dialog - so the caller knows NOT to
+   discard. */
 static Boolean SaveBeforeDiscard(void)
 {
     OSErr err;
 
     if (!gDoc.haveFile)
-        return DoSaveAs(kFormatDocx);
+        return DoSaveAs(kFormatQuill);
 
     err = WriteCurrentDocument(gDoc.format);
     if (err != noErr) {
@@ -403,6 +498,7 @@ static void DoOpen(void)
 
     TESetSelect(0, 0, gDoc.body);
     TECalText(gDoc.body);
+    UpdateScrollBarRange();
     ForceRedraw();
     SetWTitle(gDoc.window, reply.sfFile.name);
 
@@ -501,6 +597,7 @@ static void RescaleDocument(short newZoomPercent)
 
     gZoomPercent = newZoomPercent;
     TECalText(gDoc.body);
+    UpdateScrollBarRange();
     ForceRedraw();
 }
 
@@ -627,6 +724,7 @@ static void DoInsertFootnote(void)
 
     gDoc.footnoteCount++;
     gDoc.dirty = true;
+    UpdateScrollBarRange();
 }
 
 static void GetParagraphRange(long offset, long *pStart, long *pEnd)
@@ -722,6 +820,7 @@ static void ApplyParaStyle(ParaStyleKind kind)
 
     TESetStyle(doFont | doSize | doFace, &ts, true, gDoc.body);
     gDoc.dirty = true;
+    UpdateScrollBarRange();
 }
 
 static void ToggleList(ListKind kind)
@@ -772,6 +871,7 @@ static void ToggleList(ListKind kind)
     }
 
     gDoc.dirty = true;
+    UpdateScrollBarRange();
 }
 
 static void ToggleFace(Style bit)
@@ -789,6 +889,7 @@ static void ToggleFace(Style bit)
     ts.tsFace = newFace;
     TESetStyle(doFace, &ts, true, gDoc.body);
     gDoc.dirty = true;
+    UpdateScrollBarRange();
 }
 
 static void SetFontByName(const char *name)
@@ -803,6 +904,7 @@ static void SetFontByName(const char *name)
     ts.tsFont = fontID;
     TESetStyle(doFont, &ts, true, gDoc.body);
     gDoc.dirty = true;
+    UpdateScrollBarRange();
 }
 
 static void SetSize(short size)
@@ -812,6 +914,7 @@ static void SetSize(short size)
     ts.tsSize = ScaleSize(size);
     TESetStyle(doSize, &ts, true, gDoc.body);
     gDoc.dirty = true;
+    UpdateScrollBarRange();
 }
 
 /* Classic TextEdit's alignment (`just`) is a single value for the whole
@@ -832,6 +935,7 @@ static void HandleAlignMenu(short item)
 
     TESetAlignment(j, gDoc.body);
     TECalText(gDoc.body);
+    UpdateScrollBarRange();
     ForceRedraw();
     gDoc.dirty = true;
 }
@@ -985,6 +1089,7 @@ static void HandleEditMenu(short item)
             TECut(gDoc.body);
             AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
+            UpdateScrollBarRange();
             break;
         case iCopy:
             TECopy(gDoc.body);
@@ -995,6 +1100,7 @@ static void HandleEditMenu(short item)
             TEPaste(gDoc.body);
             AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
+            UpdateScrollBarRange();
             CheckDocumentSize();
             break;
         case iClear:
@@ -1003,6 +1109,7 @@ static void HandleEditMenu(short item)
             TEDelete(gDoc.body);
             AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
             gDoc.dirty = true;
+            UpdateScrollBarRange();
             break;
     }
 }
@@ -1103,6 +1210,7 @@ static void HandleReturnKey(void)
         TEDelete(gDoc.body);
         AdjustFootnotesAfterEdit(pStart, pStart - pEnd);
         gDoc.dirty = true;
+        UpdateScrollBarRange();
         return;
     }
 
@@ -1126,6 +1234,8 @@ static void HandleReturnKey(void)
         AdjustFootnotesAfterEdit(newParaStart, newMarkerLen);
         TESetSelect(newParaStart + newMarkerLen, newParaStart + newMarkerLen, gDoc.body);
     }
+
+    UpdateScrollBarRange();
 }
 
 void RunApp(void)
@@ -1153,23 +1263,39 @@ void RunApp(void)
                                 SelectWindow(whichWindow);
                             } else {
                                 Point local = event.where;
-                                Boolean isDoubleClick;
+                                ControlHandle ctl;
+                                short ctlPart;
 
                                 GlobalToLocal(&local);
+                                ctlPart = FindControl(local, whichWindow, &ctl);
 
-                                isDoubleClick = (Boolean)(
-                                    (event.when - gLastClickTime) <= kDoubleClickTicks &&
-                                    abs(local.h - gLastClickPt.h) < kDoubleClickSlop &&
-                                    abs(local.v - gLastClickPt.v) < kDoubleClickSlop);
-                                gLastClickTime = event.when;
-                                gLastClickPt = local;
+                                if (ctl == gVScrollBar && ctlPart != 0) {
+                                    if (ctlPart == inThumb) {
+                                        short oldValue = GetControlValue(gVScrollBar);
+                                        if (TrackControl(gVScrollBar, local, NULL) != 0) {
+                                            short newValue = GetControlValue(gVScrollBar);
+                                            ScrollByPixels((short)(newValue - oldValue));
+                                        }
+                                    } else {
+                                        TrackControl(gVScrollBar, local, (ControlActionUPP)ScrollAction);
+                                    }
+                                } else {
+                                    Boolean isDoubleClick;
 
-                                TEClick(local, (event.modifiers & shiftKey) != 0, gDoc.body);
+                                    isDoubleClick = (Boolean)(
+                                        (event.when - gLastClickTime) <= kDoubleClickTicks &&
+                                        abs(local.h - gLastClickPt.h) < kDoubleClickSlop &&
+                                        abs(local.v - gLastClickPt.v) < kDoubleClickSlop);
+                                    gLastClickTime = event.when;
+                                    gLastClickPt = local;
 
-                                if (isDoubleClick) {
-                                    Footnote *fn = FindFootnoteContainingOffset((**gDoc.body).selStart);
-                                    if (fn)
-                                        EditFootnote(fn);
+                                    TEClick(local, (event.modifiers & shiftKey) != 0, gDoc.body);
+
+                                    if (isDoubleClick) {
+                                        Footnote *fn = FindFootnoteContainingOffset((**gDoc.body).selStart);
+                                        if (fn)
+                                            EditFootnote(fn);
+                                    }
                                 }
                             }
                             break;
@@ -1189,6 +1315,14 @@ void RunApp(void)
                             }
                             break;
                         }
+                        case inZoomIn:
+                        case inZoomOut:
+                            if (TrackBox(whichWindow, event.where, part)) {
+                                SetPort(whichWindow);
+                                ZoomWindow(whichWindow, part, true);
+                                ResizeDocumentWindow();
+                            }
+                            break;
                         case inGoAway:
                             if (TrackGoAway(whichWindow, event.where))
                                 gDone = true;
@@ -1213,6 +1347,7 @@ void RunApp(void)
                         TEKey(c, gDoc.body);
                         AdjustFootnotesAfterEdit(pos, TextLength() - lenBefore);
                         gDoc.dirty = true;
+                        UpdateScrollBarRange();
                         CheckDocumentSize();
                     }
                     break;
@@ -1223,16 +1358,21 @@ void RunApp(void)
                     SetPort(w);
                     EraseRect(&w->portRect);
                     TEUpdate(&w->portRect, gDoc.body);
+                    DrawControls(w);
+                    DrawGrowIcon(w);
                     EndUpdate(w);
                     break;
                 }
                 case activateEvt: {
                     WindowPtr w = (WindowPtr)event.message;
                     SetPort(w);
-                    if (event.modifiers & activeFlag)
+                    if (event.modifiers & activeFlag) {
                         TEActivate(gDoc.body);
-                    else
+                        HiliteControl(gVScrollBar, 0);
+                    } else {
                         TEDeactivate(gDoc.body);
+                        HiliteControl(gVScrollBar, 255);
+                    }
                     break;
                 }
             }

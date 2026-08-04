@@ -33,6 +33,11 @@ on 68k System 7 (or Mini vMac).
   why per-paragraph alignment isn't implemented.
 - **Zoom menu**: 50% / 100% / 150% / 200% / 300% / 400%, view-only — it never
   changes what actually gets saved (see "How zoom works").
+- **Scrollbar and zoom box**: a real vertical scrollbar (Control Manager,
+  `scrollBarProc`) — drag the thumb, click the arrows, or click the track for
+  page up/down — and a title-bar zoom box that toggles the window between its
+  current size and the Window Manager's standard/maximized state. Both live
+  in `app.c`; see "The window chrome" below for how they're wired up.
 - **Footnotes**: Insert menu → "Insert Footnote…" opens a dialog to type the
   note; a small in-body marker number is inserted at the cursor, shrunk to
   ~65% size as a superscript approximation (see Known limitations — classic
@@ -41,7 +46,11 @@ on 68k System 7 (or Mini vMac).
   replaced with a real OOXML `footnoteReference` with genuine
   `vertAlign="superscript"` formatting, independent of the on-screen
   approximation.
-- **Save / Save As → .qdoc, .docx, .rtf, or .doc**:
+- **Save / Save As → .qdoc, .docx, .rtf, or .doc**: plain **Save** (⌘S) on a
+  document with no file yet defaults to `.qdoc`, not an export format —
+  dedicated "Save As .docx/.rtf/.doc" menu items exist for when an export
+  format is specifically wanted, so bare Save uses Quill's own native,
+  fully round-trippable format instead.
   - `.qdoc`: Quill's own format (`src/native.c`) — the only one of the four
     that's also readable via **File → Open…**, for resuming a writing session
     with full fidelity (exact per-run formatting, footnotes, zoom, alignment).
@@ -185,6 +194,42 @@ Two consequences of the size-rewriting approach, both handled:
   sizes (e.g. a real 12pt Heading) no matter what zoom you were looking at
   when you saved.
 
+## The window chrome
+
+The document window uses `zoomDocProc` (the window definition variant with a
+title-bar zoom box) instead of plain `documentProc`. It's worth noting this
+constant isn't actually exposed to C in this toolchain - it's a Rez-script-only
+named constant (Rez has its own symbol table for template values, separate
+from what's exported in the C headers), so `app.c` defines it locally as
+`kZoomDocProc` with its documented numeric value (8) rather than referencing
+a name that doesn't exist at the C level.
+
+Clicking the zoom box is handled the same way as any other window-frame hit:
+`FindWindow` reports `inZoomIn`/`inZoomOut`, `TrackBox` tracks the click, and
+`ZoomWindow` does the actual resize (toggling between the window's current
+size and the Window Manager's standard/maximized state, which it computes a
+reasonable default for on first use). Afterward, `ResizeDocumentWindow()` -
+the same function the grow-box drag path already used - re-lays-out the TE
+view and the scrollbar for the new size, so both paths share one layout
+routine (`LayoutContent`) rather than duplicating the geometry math.
+
+The vertical scrollbar is a real Control Manager control
+(`NewControl(..., scrollBarProc, ...)`), not a custom-drawn imitation.
+Scrolling itself goes through `TEPinScroll`, which shifts TE's `destRect`
+relative to a fixed `viewRect` and clamps automatically so it can't scroll
+past the start or end of the text - the scrollbar's displayed position is
+then *derived* from that relationship (`viewRect.top - destRect.top`) rather
+than tracked as separate state that could drift out of sync, the same
+single-source-of-truth approach `RescaleDocument` uses for zoom. Dragging the
+thumb uses the classic "outline drag" pattern (`TrackControl` with a `NULL`
+action proc: the thumb's outline follows the mouse, and the actual content
+only scrolls once you release) rather than live-scrolling during the drag -
+this is the authentic default Control Manager behavior, not a shortcut.
+`UpdateScrollBarRange()` recomputes the thumb's range/position after every
+edit that could change line count or wrapping (typing, paste, style/size
+changes, zoom, window resize) so it can't fall out of sync with what's
+actually on screen.
+
 ## How .qdoc works
 
 `.qdoc` is a small custom XML dialect, documented in full in `native.c`'s
@@ -251,12 +296,13 @@ so it's never a surprise.
 
 ## The app icon
 
-A bold "Q" letterform (a ring plus a diagonal flourish tail, like a
-handwritten capital Q) in 4 colors from the standard classic Mac OS 16-color
-icon palette: white background, black outline, brown ring fill, blue tail.
-Provided as both a 1-bit fallback (`ICN#`/`ics#`, 32×32 and 16×16) and true
-color (`icl4`/`ics4`, 4-bit/16-color depth, though only 4 of the 16 are
-actually used).
+A stylized quill pen — a diagonal tapered shaft, feather barbs branching off
+one edge, and a small ink drop at the nib — in 4 colors from the standard
+classic Mac OS 16-color icon palette: white background, black
+outline/barbs/nib, tan feather fill, blue ink drop. Provided as both a
+1-bit fallback (`ICN#`/`ics#`, 32×32 and 16×16) and true color
+(`icl4`/`ics4`, 4-bit/16-color depth, though only 4 of the 16 are actually
+used).
 
 The pixel data was generated programmatically (a small Python script doing
 circle/line-segment distance math, not hand-plotted) rather than
