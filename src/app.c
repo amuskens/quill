@@ -427,90 +427,79 @@ static short UnscaleSize(short actualSize)
     return (short)(((long)actualSize * 100 + gZoomPercent / 2) / gZoomPercent);
 }
 
-/* Zoom is implemented by literally rescaling every run's stored point size
-   (proportionally, from the current zoom to the new one) rather than a
-   separate visual-only transform - see the README for why (classic
-   TextEdit/QuickDraw has no coordinate-scaling primitive short of an
-   offscreen GWorld blit, which is much more machinery for this pass).
-   Save/Save As always rescale to 100% first so exported files hold true
-   logical sizes no matter the current zoom. */
+/* Zoom is implemented by rescaling every stored point size proportionally
+   (current zoom -> new zoom) rather than a separate visual-only transform -
+   see the README for why (classic TextEdit/QuickDraw has no
+   coordinate-scaling primitive short of an offscreen GWorld blit, which is
+   much more machinery for this pass). Save/Save As always rescale to 100%
+   first so exported files hold true logical sizes no matter the current
+   zoom.
+
+   This edits the style TABLE's size fields directly, in place, rather than
+   the earlier approach of walking runs and calling TESetSelect/TESetStyle
+   per run. That earlier approach was unreliable in practice: TESetStyle can
+   split/merge/reindex style-table entries as it goes, and issuing a whole
+   sequence of such calls back to back (one per run, in the same pass) could
+   end up applying to the wrong entries or skipping some - which matches
+   reports of "normal text doesn't scale" / "scales inconsistently with
+   headings". Every run's font/size/face lives in exactly one STElement
+   entry in the style table (`styleTab`), addressed by `runs[i].styleIndex`;
+   multiple runs can share one entry. Multiplying every entry's `stSize` in
+   place rescales *all* text in one pass, with no risk of run-table
+   reshuffling, and doesn't touch the selection at all. The one thing not
+   covered by the table is the "null style" (what the next *typed*
+   character will use, relevant for a still-empty document or typing at the
+   very end) - that's rescaled the same way via its own separate struct. */
 static void RescaleDocument(short newZoomPercent)
 {
     TEStyleHandle sh;
     TEStyleRec *rec;
     STHandle tab;
     STElement *table;
-    long nRuns, i;
-    long *starts;
-    short *sizes;
-    long selStart, selEnd;
+    short nStyles, i;
+    NullSTHandle nsh;
 
     if (newZoomPercent == gZoomPercent)
         return;
 
-    selStart = (**gDoc.body).selStart;
-    selEnd = (**gDoc.body).selEnd;
-
     sh = TEGetStyleHandle(gDoc.body);
     HLock((Handle)sh);
     rec = *sh;
-    nRuns = rec->nRuns;
+    nStyles = rec->nStyles;
     tab = rec->styleTab;
+    nsh = rec->nullStyle;
+
     HLock((Handle)tab);
     table = *tab;
+    for (i = 0; i < nStyles; i++) {
+        table[i].stSize = (short)(((long)table[i].stSize * newZoomPercent + gZoomPercent / 2) / gZoomPercent);
+    }
+    HUnlock((Handle)tab);
 
-    starts = (long *)malloc(sizeof(long) * (nRuns > 0 ? nRuns : 1));
-    sizes = (short *)malloc(sizeof(short) * (nRuns > 0 ? nRuns : 1));
+    if (nsh) {
+        NullSTPtr ns;
+        StScrpHandle scrapH;
 
-    for (i = 0; i < nRuns; i++) {
-        StyleRun sr = rec->runs[i];
-        starts[i] = sr.startChar;
-        sizes[i] = (i < nRuns - 1) ? table[sr.styleIndex].stSize : 12;
+        HLock((Handle)nsh);
+        ns = *nsh;
+        scrapH = ns->nullScrap;
+        if (scrapH) {
+            StScrpRec *scrap;
+
+            HLock((Handle)scrapH);
+            scrap = *scrapH;
+            if (scrap->scrpNStyles > 0) {
+                ScrpSTElement *e = &scrap->scrpStyleTab[0];
+                e->scrpSize = (short)(((long)e->scrpSize * newZoomPercent + gZoomPercent / 2) / gZoomPercent);
+            }
+            HUnlock((Handle)scrapH);
+        }
+        HUnlock((Handle)nsh);
     }
 
-    HUnlock((Handle)tab);
     HUnlock((Handle)sh);
 
-    for (i = 0; i < nRuns - 1; i++) {
-        long rangeStart = starts[i];
-        long rangeEnd = starts[i + 1];
-        TextStyle ts;
-
-        if (rangeEnd <= rangeStart)
-            continue;
-
-        memset(&ts, 0, sizeof(ts));
-        ts.tsSize = (short)(((long)sizes[i] * newZoomPercent + gZoomPercent / 2) / gZoomPercent);
-
-        TESetSelect(rangeStart, rangeEnd, gDoc.body);
-        TESetStyle(doSize, &ts, false, gDoc.body);
-    }
-
-    free(starts);
-    free(sizes);
-
-    /* nRuns <= 1 means there's no real text yet (brand-new empty document):
-       the per-run loop above never runs, so without this, text typed after
-       zooming - before any explicit formatting - would come out at the old,
-       unscaled size. TEContinuousStyle on the (necessarily collapsed, since
-       there's no text) selection reports the "next typed character" style;
-       TESetStyle on that same collapsed selection is the documented way to
-       update it. Only safe to do when there are no real runs: otherwise the
-       caret could be sitting inside/at the edge of a run this function
-       already rescaled above, and this would double-scale it. */
-    if (nRuns <= 1) {
-        short qmode = doSize;
-        TextStyle qts;
-        if (TEContinuousStyle(&qmode, &qts, gDoc.body)) {
-            TextStyle nts;
-            memset(&nts, 0, sizeof(nts));
-            nts.tsSize = (short)(((long)qts.tsSize * newZoomPercent + gZoomPercent / 2) / gZoomPercent);
-            TESetStyle(doSize, &nts, false, gDoc.body);
-        }
-    }
-
     gZoomPercent = newZoomPercent;
-    TESetSelect(selStart, selEnd, gDoc.body);
     TECalText(gDoc.body);
     ForceRedraw();
 }

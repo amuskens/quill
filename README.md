@@ -14,11 +14,14 @@ on 68k System 7 (or Mini vMac).
   fonts (Times, Geneva, New York, Helvetica, Courier, Monaco, Palatino), and
   point sizes (9–24). Checkmarks reflect the style at the current selection.
 - **Style menu**: paragraph styles — Normal, Heading 1–4, Quote, Bibliography
-  — plus Bullet List / Numbered List toggles. Every style uses the default
-  font at 12pt; only the face distinguishes them (Heading 1 bold, Heading 2
-  italic+bold, Heading 3 italic, Heading 4 underline, Quote italic+underline,
-  Bibliography bold+italic+underline). Applying a style **leaves the affected
-  paragraph(s) selected** so the change is immediately visible. Bullet/Numbered
+  — plus Bullet List / Numbered List toggles. Always the default font
+  (Times); size/face per style: Normal 12pt plain, Heading 1 14pt plain,
+  Heading 2 12pt italic, Heading 3 12pt underlined, Heading 4 12pt
+  italic+underlined, Quote 12pt italic, Bibliography 10pt plain. **Heading 2
+  and Quote are identical** (12pt italic) — a deliberate choice, not a bug;
+  see "How paragraph styles/lists work" below for what that means in
+  practice. Applying a style **leaves the affected paragraph(s) selected**
+  so the change is immediately visible. Bullet/Numbered
   List items continue onto the next line when you press Return, like Word —
   pressing Return again on an empty item exits the list instead of adding
   another marker. See "How paragraph styles/lists work" below for how this
@@ -107,12 +110,14 @@ export), piggybacking on TextEdit's own tracking instead of duplicating it:
 - **Paragraph style** (Heading 1–4 / Quote / Bibliography) is recognized by
   matching a paragraph's own (size, bold, italic, underline) against a fixed
   table (`kParaStyleSpecs` in `wordproc.h`) — the same combination "Apply
-  Style" itself sets. Since every style now shares the same 12pt size, the
-  *only* signal is the face combination — manually toggling Bold+Underline on
-  plain text, for instance, isn't one of the defined combinations, but
-  Heading 3's italic-alone *is* something a user might reach for just for
-  emphasis, and would be misidentified as that heading. Documented tradeoff,
-  not a bug.
+  Style" itself sets. Most styles share 12pt, so face is often the only
+  distinguishing signal — manually italicizing plain 12pt text, for
+  instance, would be misidentified as Heading 2/Quote. **Heading 2 and
+  Quote are fully identical** (12pt, italic, not bold, not underlined) by
+  explicit choice, so they're not just collision-prone but genuinely
+  indistinguishable: applying Quote will show up checked as Heading 2 in
+  the Style menu, and export with `w:pStyle val="Heading2"`, not Quote.
+  Documented tradeoff, not a bug.
 - **List membership** is recognized by a literal `"• "` or `"<digits>. "`
   prefix at the paragraph's start, inserted by the Bullet/Numbered List
   commands. On `.docx` export, that literal prefix is *stripped* and replaced
@@ -130,33 +135,42 @@ export), piggybacking on TextEdit's own tracking instead of duplicating it:
 Classic QuickDraw has no coordinate-scaling transform, and TextEdit has no
 separate "display size" concept — the only way to make text visibly bigger
 or smaller is to change the actual point size TextEdit renders at. So Zoom
-**literally rescales every run's stored point size** proportionally
-(`RescaleDocument` in `app.c`) rather than being a non-destructive visual
-transform. (A pixel-accurate, format-preserving zoom is possible in classic
-Mac OS via an offscreen GWorld rendered at 100% and blitted through
-`CopyBits` with a scaled destination rect — that's how period apps like
-this actually did it — but it's meaningfully more machinery: it touches
-window resize, TE's destRect/viewRect math, and mouse-click-to-text-offset
-conversion. Out of scope for this pass; `RescaleDocument`'s doc comment in
-`app.c` has the details if you want to build it.)
+**rescales every stored point size** proportionally (`RescaleDocument` in
+`app.c`) rather than being a non-destructive visual transform. (A
+pixel-accurate, format-preserving zoom is possible in classic Mac OS via an
+offscreen GWorld rendered at 100% and blitted through `CopyBits` with a
+scaled destination rect — that's how period apps like this actually did it
+— but it's meaningfully more machinery: it touches window resize, TE's
+destRect/viewRect math, and mouse-click-to-text-offset conversion. Out of
+scope for this pass; `RescaleDocument`'s doc comment in `app.c` has the
+details if you want to build it.)
 
 After rescaling, `app.c`'s `ForceRedraw()` synchronously erases and redraws
 the window right there (rather than just `InvalRect`-ing and waiting for the
 next update event) so the new size is visible immediately — the same helper
 is used after alignment changes and New.
 
-`RescaleDocument` walks the *existing* style runs, which is all there is to
-rescale once a document has real text. But a brand-new, still-empty document
-has no runs at all yet — TextEdit tracks "what style should the next typed
-character get" separately (its "null style"). Without special-casing that,
-zooming an empty window and then typing would produce text at the old,
-unscaled size. `RescaleDocument` detects the no-real-runs case
-(`nRuns <= 1`) and rescales that next-character style too, via
-`TEContinuousStyle`/`TESetStyle` on the (necessarily collapsed, since
-there's no text) selection — the documented, public mechanism for reading
-and writing it. `RunApp()` also calls `AdjustMenus()` once immediately after
-creating the window, so Format/Style/Align/Zoom checkmarks are correct
-before you've touched anything, not just after the first click.
+**Implementation note (this took two attempts):** the first version walked
+each style *run* and issued a `TESetSelect`/`TESetStyle` pair per run to
+rescale it. That turned out to be unreliable in testing - inconsistent
+scaling between normal text and headings, sometimes text not scaling at
+all. The likely cause: `TESetStyle` can split, merge, and reindex the style
+*table* as a side effect of each call, so a sequence of such calls back to
+back in one pass could end up touching the wrong entries or missing some.
+The current version instead edits the style **table** directly: every run's
+font/size/face lives in exactly one `STElement` entry (`styleTab`, found via
+`TEGetStyleHandle`), addressed by `runs[i].styleIndex` - multiple runs can
+share one entry. Multiplying every table entry's `stSize` in place rescales
+all text in a single pass, doesn't touch the selection at all, and has no
+run-splitting side effects to go wrong. The one thing not covered by the
+table is TextEdit's separate "null style" (what the *next typed* character
+will use - relevant for a still-empty document, or typing at the very end)
+- that's rescaled the same way via its own struct
+(`nullStyle -> nullScrap -> scrpStyleTab[0].scrpSize`), unconditionally
+rather than only in the empty-document case the first version special-cased.
+`RunApp()` also calls `AdjustMenus()` once immediately after creating the
+window, so Format/Style/Align/Zoom checkmarks are correct before you've
+touched anything, not just after the first click.
 
 Two consequences of the size-rewriting approach, both handled:
 

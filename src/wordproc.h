@@ -76,17 +76,19 @@ typedef struct {
     Boolean underline;
 } ParaStyleSpec;
 
-/* Every style uses the same 12pt default font/size; only the face bits
-   distinguish them. Heading 1: bold. Heading 2: italic+bold.
-   Heading 3: italic. Heading 4: underline. */
+/* NOTE: Heading 2 and Quote are intentionally identical here (12pt, italic,
+   not bold, not underlined) - a deliberate choice, not an oversight. Since
+   paragraph style is recognized by matching this exact (size,bold,italic,
+   underline) combination (see the comment above), the two are genuinely
+   indistinguishable: applying Quote will show/export as Heading 2. */
 static const ParaStyleSpec kParaStyleSpecs[kParaStyleCount] = {
     {12, false, false, false}, /* Normal */
-    {12, true,  false, false}, /* Heading 1 */
-    {12, true,  true,  false}, /* Heading 2 */
-    {12, false, true,  false}, /* Heading 3 */
-    {12, false, false, true},  /* Heading 4 */
-    {12, false, true,  true},  /* Quote */
-    {12, true,  true,  true}   /* Bibliography */
+    {14, false, false, false}, /* Heading 1 */
+    {12, false, true,  false}, /* Heading 2 */
+    {12, false, false, true},  /* Heading 3 */
+    {12, false, true,  true},  /* Heading 4 */
+    {12, false, true,  false}, /* Quote - same combo as Heading 2, see note above */
+    {10, false, false, false}  /* Bibliography */
 };
 
 /* docx w:styleId values (no spaces; Heading1-4 match Word's own built-in IDs) */
