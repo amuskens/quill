@@ -112,9 +112,10 @@ on 68k System 7 (or Mini vMac).
 - `src/zip.c` / `zip.h` — minimal ZIP writer (stored entries only) with a
   hand-rolled CRC32.
 - `src/main.r` — Rez resources: menus (`MBAR`/`MENU`), dialogs (`DLOG`/`DITL`)
-  for the footnote editor and the save-changes confirmation, alerts
-  (`ALRT`/`DITL`) for About/error/warning, and the `SIZE` resource (1.5 MB
-  preferred / 512 KB minimum partition). `#include`s `icon.r`.
+  for the footnote/comment editors and the save-changes confirmation, alerts
+  (`ALRT`/`DITL`) for About/error/warning, and the `SIZE` resource (2 MB
+  preferred / 512 KB minimum partition — see "Document size limit" for why
+  2 MB, not more). `#include`s `icon.r`.
 - `src/icon.r` — the app icon (`BNDL`/`FREF`/`ICN#`/`ics#`/`icl4`/`ics4`) —
   see "The app icon" below.
 - `CMakeLists.txt` — Retro68 build description (uses its `add_application()`
@@ -501,20 +502,25 @@ does handle:
 up front (simplest way to run a single-pass scanner over it) - on this
 app's small, fixed heap that allocation can genuinely fail for a large
 file, and originally wasn't checked for `NULL` at all, meaning `FSRead`
-would've been handed a null destination pointer. Fixed with three layers:
-a file-size check *before* attempting the allocation (rejects with a clear
-message rather than gambling on a large malloc succeeding), a `NULL` check
-on the allocation itself as a backstop, and a running check against
+would've been handed a null destination pointer. Handled in three layers:
+a generous-but-bounded file-size sanity check *before* attempting the
+allocation (1.8 MB - large enough to give genuinely big files a real shot,
+small enough to leave headroom under the 2 MB heap for everything else the
+app needs; rejects a clearly-doomed attempt outright rather than gambling
+on it), a `NULL` check on the allocation itself as the precise backstop if
+a file under that ceiling still doesn't fit, and a running check against
 `kRtfMaxImportChars` (28,000, matching the app's own `kSizeWarnThreshold`)
 as text is actually inserted during parsing - because RTF markup overhead
 makes a file's *byte size* a poor proxy for the *character count* it'll
 produce, so the real ceiling has to be enforced against what's actually
-being inserted, not guessed from the file size alone. Hitting any of these
-returns a distinct `kImportTooLargeErr` (defined in `wordproc.h`, shared
-with `doc.c`'s reader below) so `DoImport` can show a specific "too large"
-message instead of a generic "could not be imported" one, and discards
-whatever was partially inserted rather than leaving a truncated document in
-the window.
+being inserted, not guessed from the file size alone. All three return the
+same distinct `kImportTooLargeErr` (defined in `wordproc.h`, shared with
+`doc.c`'s reader below); the first two mean nothing was imported at all
+(there's no partial content yet to keep), but hitting the character
+ceiling *during* insertion is different and handled differently - see
+"Document size limit"'s "Import no longer discards a document just for
+being too long" for why that one keeps what was already inserted instead
+of throwing it away.
 
 What it deliberately does **not** attempt: paragraph alignment, lists/
 tables, embedded pictures/objects, footnotes, and comments (the `\footnote`
@@ -579,13 +585,18 @@ mix-up between two similarly-named capacity counters in the FAT-building
 code) before it ever reached the actual application.
 
 Like the RTF reader, oversized files are rejected before attempting a
-large allocation (the ceiling here is deliberately higher and independent
-of the RTF one - a `.doc` file's byte size is dominated by internal
-structure overhead like fonts and revision history, not the plain text it
-produces), the allocation itself is `NULL`-checked, and text insertion is
-capped against the same practical TextEdit character ceiling, all
-returning `kImportTooLargeErr` for a specific, honest error message rather
-than a crash or a silent truncation.
+large allocation (1.8 MB, the same sanity ceiling as RTF's - there's no
+strong reason for `.doc`'s to be different, since both are ultimately
+bounded by the same 2 MB heap regardless of which format's overhead
+dominates a given file's byte size), the allocation itself is
+`NULL`-checked, and text insertion is capped against the same practical
+TextEdit character ceiling (`kDocMaxImportChars`, also 28,000). All three
+return `kImportTooLargeErr` - but not all three mean the same thing to the
+caller: the two upfront checks mean nothing was imported (nothing to keep
+yet), while crossing the character ceiling *during* extraction keeps
+everything inserted before that point intact and lets `DoImport` treat it
+as a truncated-but-real partial import with a warning, rather than
+discarding it - see "Document size limit" for the reasoning.
 
 ## How comments work
 
@@ -649,9 +660,8 @@ Classic TextEdit tracks every offset it deals with — `selStart`, `selEnd`,
 16-bit signed `INTEGER` (confirmed directly in the Toolbox headers this
 toolchain ships). That makes **~32,767 characters (roughly 5,000–5,500
 words, ~20 double-spaced pages) a hard ceiling**, not a tunable one — it's
-not affected by the app's heap size (`SIZE` resource: 512 KB min / 1.5 MB
-pref), which is comfortably large enough that heap exhaustion isn't the
-real constraint here. Approaching the real limit degrades before it
+an *addressing* limit, not a capacity one, so it holds regardless of how
+much heap the app is given. Approaching the real limit degrades before it
 outright crashes (garbled selection, wrong line breaks), so the safe
 ceiling is somewhat below 32,767, not exactly at it.
 
@@ -660,13 +670,54 @@ pasting, or opening a file) when a document crosses **28,000 characters**
 — about a 10% margin — via a caution alert, then stays quiet unless the
 document is trimmed back under the threshold and crosses it again.
 
-This can't be fixed by "buffering" in the virtual-memory sense — it's an
-*addressing* limit, not a capacity one; more RAM doesn't help a 16-bit
-offset point past 32,767. A real fix means retiring single-TE-record
-TextEdit for large documents in favor of a custom paginated/multi-record
-engine (each chunk its own TE record, swapped in/out as the user scrolls)
-— the same scale of rewrite as true per-paragraph alignment, and, like
-that, deliberately out of scope for this pass.
+This can't be fixed by "buffering" in the virtual-memory sense — more RAM
+doesn't help a 16-bit offset point past 32,767. A real fix means retiring
+single-TE-record TextEdit for large documents in favor of a custom
+paginated/multi-record engine (each chunk its own TE record, swapped
+in/out as the user scrolls) — the same scale of rewrite as true
+per-paragraph alignment, and, like that, deliberately out of scope for
+this pass.
+
+**The app's heap (`SIZE` resource: 512 KB min / 2 MB pref) is a separate
+thing from this 32,767-character ceiling, but matters for a different
+reason: Import.** `.rtf` and `.doc` readers each malloc the *whole source
+file* into memory up front to run their single-pass parsers over it (see
+"Importing foreign files" and "Reading real binary .doc files" below) -
+that allocation, not the 32,767-character limit, is what a bigger heap
+actually helps with, since it lets a larger source file be attempted at
+all before either reader even gets to the character-level ceiling. 2 MB
+preferred (rather than requesting more) is a deliberate choice: on a
+4 MB-RAM Mac, the System itself needs a meaningful share of that memory,
+so requesting a partition close to the machine's *total* RAM would be far
+less likely to actually be granted at launch than a more realistic 2 MB
+ask - a preference the Process Manager can't satisfy still lets the app
+launch with less, down to the 512 KB minimum, just with a smaller import
+ceiling.
+
+Reflecting that same ceiling everywhere it's checked: both readers use a
+generous but bounded upfront file-size sanity check (large enough to
+allow genuinely big source files a real attempt, small enough to leave
+headroom under the heap for everything else the app needs) before even
+attempting the allocation, and a `NULL` check on the allocation itself as
+the precise backstop if a given file doesn't fit despite passing that
+check - see "Large/oversized files fail cleanly instead of crashing or
+corrupting" above and its counterpart in "Reading real binary .doc files"
+for the exact numbers and reasoning.
+
+**Import no longer discards a document just for being too long to import
+in full.** Both `ReadDocumentFromRtf` and `ReadDocumentFromDoc` insert text
+piece by piece, checking the running character count against their
+ceiling as they go; the moment inserting the *next* piece would cross it,
+they simply stop - keeping everything inserted so far intact rather than
+rolling it back - and return `kImportTooLargeErr`. `DoImport` treats that
+specific error as a **partial success**, not a failure: it skips the
+usual discard-and-fail path entirely, finishes the same bookkeeping a
+clean import would (title, dirty flag, zoom, redraw), and shows a warning
+explaining that the document was truncated at the character limit rather
+than a `Fail` alert that would otherwise imply nothing was imported at
+all. Any *other* error (a genuinely malformed file, or memory exhausted
+before any text was even reached) still discards and fails outright, since
+there's no trustworthy partial content to keep in those cases.
 
 ## Why .doc is actually RTF
 

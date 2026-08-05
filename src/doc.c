@@ -493,12 +493,19 @@ OSErr ReadDocumentFromDoc(Document *doc, const FSSpec *src)
 
     /* Whole file is read into one buffer, same tradeoff as rtf.c's reader -
        simplest way to run the container parser, at the cost of needing
-       the file to fit in one contiguous block. A real .doc's byte size is
-       dominated by internal structure overhead (fonts, compatibility
-       data, revision history), not the plain text it'll produce, so this
-       ceiling is deliberately much more generous than the eventual
-       character-count limit, and independent of it. */
-    if (fileLen > 1500000L) { FSClose(refNum); return kImportTooLargeErr; }
+       the file to fit in one contiguous block. This is a sanity ceiling
+       against a clearly-doomed attempt (many megabytes on this app's much
+       smaller heap - see the SIZE resource), not a prediction of whether
+       the file's *text* will fit: a real .doc's byte size is dominated by
+       internal structure overhead (fonts, compatibility data, revision
+       history), not the plain text it'll produce, and that text-level
+       limit (kDocMaxImportChars) is enforced separately, per piece, as
+       text is actually extracted below - so a large source file still
+       contributes a full, truncated-at-the-limit import rather than being
+       turned away outright just for being large. The NULL check right
+       after the allocation is the real, precise safety net if this file
+       does turn out not to fit despite passing this check. */
+    if (fileLen > 1800000L) { FSClose(refNum); return kImportTooLargeErr; }
 
     fileBuf = (unsigned char *)malloc(fileLen > 0 ? fileLen : 1);
     if (!fileBuf) { FSClose(refNum); return memFullErr; }

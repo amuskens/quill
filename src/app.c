@@ -654,14 +654,13 @@ typedef enum { kImportRtf, kImportOle2Doc, kImportUnknown } ImportKind;
 /* Reports why a ReadDocumentFrom{Rtf,Doc} failure happened, in terms
    specific enough to actually act on - "could not be imported" alone
    doesn't tell anyone whether to try a smaller file, free up memory, or
-   give up on that particular file entirely. */
+   give up on that particular file entirely. kImportTooLargeErr is
+   deliberately not handled here - DoImport treats it as a partial success
+   (keep what was imported, warn instead of failing), not a failure this
+   function's callers discard-and-report path applies to. */
 static void FailImportError(OSErr err, Boolean isDoc)
 {
-    if (err == kImportTooLargeErr) {
-        Fail("That file is too large to import - classic TextEdit has a "
-             "hard limit around 28,000 characters, and this file would "
-             "exceed it.");
-    } else if (err == memFullErr) {
+    if (err == memFullErr) {
         Fail("Not enough memory to import that file.");
     } else if (isDoc) {
         Fail("That file could not be imported - its internal structure "
@@ -744,8 +743,14 @@ static void DoImport(void)
                                 : ReadDocumentFromDoc(&gDoc, &reply.sfFile);
     if (err != noErr) {
         if (err == kImportTooLargeErr) {
-            /* Keep the partial content inserted by the reader and warn the user. */
-            Warn("The file was partially imported: only the portion that fit in memory was opened.");
+            /* Keep the partial content inserted by the reader and warn the
+               user, rather than discarding it and failing outright - see
+               ReadDocumentFromRtf/ReadDocumentFromDoc's tail for where the
+               reader itself stops inserting but leaves what's there intact. */
+            Warn("This file was larger than classic TextEdit's ~28,000-"
+                 "character limit, so only the beginning was imported - "
+                 "everything past that point was left out. Check the end "
+                 "of the document before relying on it being complete.");
         } else {
             FailImportError(err, (Boolean)(kind == kImportOle2Doc));
             DoNew();

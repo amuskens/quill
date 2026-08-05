@@ -562,15 +562,18 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
     if (err != noErr) { FSClose(refNum); return err; }
 
     /* This whole file gets malloc'd into one buffer up front (simplest way
-       to run a single-pass scanner over it) - on this app's small, fixed
-       heap (see the SIZE resource) that can genuinely fail for a large
-       file, long before RTF's own ~28,000-character import ceiling
-       (kRtfMaxImportChars) would ever come into play. Rejected by size
-       here, before attempting the allocation, rather than finding out via
-       a NULL malloc return - a generous ceiling given RTF markup overhead
-       (worst case, heavy \uNNNN? escaping) can inflate byte size well past
-       the eventual character count. */
-    if (fileLen > 500000) {
+       to run a single-pass scanner over it). This sanity ceiling only
+       exists to refuse a clearly-doomed attempt (a many-megabyte file on
+       this app's much smaller heap - see the SIZE resource); it is
+       deliberately NOT trying to predict whether the file's *content* will
+       fit within RTF's own ~28,000-character import ceiling
+       (kRtfMaxImportChars) - that's enforced separately, per character, as
+       text is actually inserted (see the tooLarge handling below), and
+       lets a bigger source file still contribute a full, truncated-at-the-
+       limit import rather than being rejected outright just for being
+       large. If the allocation itself fails despite passing this check,
+       the NULL check right after is the real, precise safety net. */
+    if (fileLen > 1800000L) {
         FSClose(refNum);
         return kImportTooLargeErr;
     }
