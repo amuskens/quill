@@ -20,8 +20,8 @@ resource 'SIZE' (-1) {
     reserved,
     reserved,
     reserved,
-    512 * 1024,
-    2 * 1024 * 1024
+    2 * 1024 * 1024, /* preferred */
+    512 * 1024        /* minimum */
 };
 
 resource 'MBAR' (128) {

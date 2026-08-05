@@ -89,7 +89,6 @@ static Point gLastClickPt = { 0, 0 };
 static Boolean gSizeWarningShown = false;
 
 static void ToolboxInit(void);
-static void TryMaximizeHeap(void);
 static void SetupMenus(void);
 static void CreateDocumentWindow(void);
 static void LayoutContent(Rect *viewRectOut, Rect *scrollRectOut);
@@ -153,62 +152,6 @@ static void ToolboxInit(void)
     TEInit();
     InitDialogs(NULL);
     InitCursor();
-}
-
-/* Best-effort attempt to grow the application partition at startup.
-   Strategy:
-   - Prefer to set the application's limit to 4 MiB using SetApplLimit.
-   - If that fails or the actual usable heap is still small, probe by
-     attempting progressively smaller allocations (NewPtr) to discover
-     a large allocatable block. If a probe of size S succeeds, attempt
-     to set the application limit to 2*S (approximate making that block
-     represent ~50%% of the partition).
-
-   This is intentionally conservative and best-effort: the Memory Manager
-   / OS (or the emulator) ultimately decides how much to grant. */
-static void TryMaximizeHeap(void)
-{
-    const long kMaxRequested = 4L * 1024L * 1024L; /* 4 MB */
-    const long kMinProbe = 4 * 1024; /* 4 KB smallest probe */
-    OSErr err;
-
-    /* First, ask the system for the full 4MB partition. If the system can
-       satisfy it, great. On many hosts/emulators this may fail if the
-       guest has less physical RAM configured. */
-    /* Ask the Memory Manager to raise the application partition to 4 MiB.
-       SetApplLimit takes a Ptr argument and returns void, so call it directly.
-       Passing an integer as a Ptr is the classic API usage when requesting a
-       numeric new limit. */
-    SetApplLimit((Ptr)kMaxRequested);
-
-    /* Probe: try to allocate a single contiguous block of up to half of
-       the requested max (i.e., 2 MB). If that fails, halve and retry until
-       a small threshold. */
-    long probe = kMaxRequested / 2;
-    while (probe >= kMinProbe) {
-        Ptr p = NewPtr((Size)probe);
-        if (p != NULL) {
-            /* allocation succeeded: free it and try to set appl limit to
-               twice the probe size (so the probe represents ~50% of the
-               requested partition). If SetApplLimit fails, ignore it - at
-               least the large allocation succeeded which means usable heap
-               is already large enough for that probe. */
-            DisposePtr(p);
-            long desiredLimit = probe * 2;
-            if (desiredLimit > kMaxRequested)
-                desiredLimit = kMaxRequested;
-            /* Request a partition roughly twice the probe so the probe is
-               about 50% of it. SetApplLimit is void and expects a Ptr. */
-            SetApplLimit((Ptr)desiredLimit);
-            return;
-        }
-        probe /= 2; /* try a smaller probe */
-    }
-
-    /* If we get here, every probe failed - can't allocate even a small
-       multi-kilobyte block beyond current usage. Give up silently; the
-       app will run with its existing partition (SIZE resource still in
-       effect). */
 }
 
 static void SetupMenus(void)
@@ -283,6 +226,18 @@ static void CreateDocumentWindow(void)
     gDoc.haveFile = false;
     gDoc.format = kFormatQuill;
     gDoc.footnoteCount = 0;
+    gDoc.commentCount = 0;
+    /* Malloc'd rather than fixed arrays inside Document itself: at
+       kMaxFootnotes/kMaxComments (200 each) apiece, two fixed 200-entry
+       arrays would add real weight to the app's global data - and since
+       Document is a global (gDoc), that competes directly with stack
+       space in the same partition (see the SIZE resource discussion in
+       the README's "Document size limit"). Most documents will never come
+       close to needing either array's full size, so reserving it as
+       actual global storage regardless was already wasteful even before
+       that concern. Never freed - gDoc lives for the app's whole run. */
+    gDoc.footnotes = (Footnote *)malloc(sizeof(Footnote) * kMaxFootnotes);
+    gDoc.comments = (Footnote *)malloc(sizeof(Footnote) * kMaxComments);
 
     /* Start maximized: zoom to the Window Manager's standard (full-screen)
        state, then re-lay-out TE/the scrollbar for the new size, same as a
@@ -1706,9 +1661,6 @@ void RunApp(void)
     EventRecord event;
 
     ToolboxInit();
-    /* Try to grow the application's heap before allocating big buffers/windows */
-    TryMaximizeHeap();
-
     SetupMenus();
     CreateDocumentWindow();
     AdjustMenus(); /* so Format/Style/Align/Zoom checkmarks are correct before any interaction */

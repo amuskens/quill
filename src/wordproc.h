@@ -68,9 +68,9 @@ typedef struct {
     FSSpec file;
     SaveFormat format;              /* which writer Save (not Save As) should use */
     short footnoteCount;
-    Footnote footnotes[kMaxFootnotes];
+    Footnote *footnotes;            /* malloc'd for kMaxFootnotes entries once at startup - see CreateDocumentWindow */
     short commentCount;
-    Footnote comments[kMaxComments];
+    Footnote *comments;             /* malloc'd for kMaxComments entries once at startup - see CreateDocumentWindow */
     Boolean dirty;
 } Document;
 

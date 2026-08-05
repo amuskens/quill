@@ -377,7 +377,19 @@ OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest, Boolean includeComme
    relative to *that* file's font table, so recovering real font names
    (rather than assuming \f0 means Times, \f1 means Geneva, etc. the way
    this app's own writer numbers things) matters for opening real
-   Word-authored files, not just round-tripping this app's own output. */
+   Word-authored files, not just round-tripping this app's own output.
+
+   The source file is never loaded into one buffer. RtfEnsureLookahead
+   keeps a small fixed-size sliding window (kRtfChunkSize) topped up,
+   refilled from the still-open file as the single left-to-right scan
+   below consumes it - so peak memory here is that window plus the
+   "pending run" buffer (RtfParser.pending), regardless of how large the
+   source file is. It's called only *between* tokens (top of the main
+   loop, and top of the \u fallback-skip loop), each time asking for
+   kRtfLookahead bytes of headroom - comfortably more than any single
+   control word, hex escape, or number RTF actually produces - so a
+   token's pointers (wordStart, etc.) are always fully resolved before the
+   window can next be compacted, and never dangle across a refill. */
 
 typedef struct {
     Boolean bold, italic, underline;
@@ -388,6 +400,47 @@ typedef struct {
 #define kRtfMaxDepth    64
 #define kRtfMaxFonts    32
 #define kRtfFontNameLen 64
+
+#define kRtfChunkSize   16384 /* sliding window size read from the file at a time */
+#define kRtfLookahead     512 /* headroom ensured before each token starts */
+
+typedef struct {
+    short refNum;
+    char *buf;           /* kRtfChunkSize bytes */
+    long fileRemaining;  /* bytes of the source file not yet read into buf */
+} RtfSrc;
+
+/* Ensures at least minBytes are available starting at *pRef, or that
+   *pRef..*endRef covers every byte left in the file if fewer than
+   minBytes remain - compacting the window (shifting unconsumed bytes to
+   its start) and reading more from the file as needed. Only ever called
+   between tokens - see the header comment above for why that's what
+   makes the compaction it performs safe. */
+static OSErr RtfEnsureLookahead(RtfSrc *src, const char **pRef, const char **endRef, long minBytes)
+{
+    long have = (long)(*endRef - *pRef);
+    long want, count;
+    OSErr err;
+
+    if (have >= minBytes || src->fileRemaining <= 0)
+        return noErr;
+
+    memmove(src->buf, *pRef, have);
+    *pRef = src->buf;
+    *endRef = src->buf + have;
+
+    want = kRtfChunkSize - have;
+    if (want > src->fileRemaining) want = src->fileRemaining;
+    if (want <= 0) return noErr;
+
+    count = want;
+    err = FSRead(src->refNum, &count, src->buf + have);
+    if (err != noErr) return err;
+
+    src->fileRemaining -= count;
+    *endRef = src->buf + have + count;
+    return noErr;
+}
 
 typedef struct {
     Document *doc;
@@ -485,6 +538,25 @@ static void RtfFlush(RtfParser *rp)
         CToPascal("Times", pname);
     }
     GetFNum(pname, &fontID);
+    if (fontID == systemFont) {
+        /* GetFNum quietly resolves an unmatched name to font ID 0 (the
+           *system* font) rather than failing - and a real .rtf's font
+           table very often names fonts that only exist on whatever
+           machine authored it ("Times New Roman", "Calibri", "Arial", none
+           of which classic Mac OS ships). Leaving fontID at 0 here isn't
+           just "the wrong font" - it's specifically the signal this app's
+           own style detection reads as "Plain Text" rather than "Normal"
+           (see wordproc.h's ParaStyleSpec.systemFont comment and how
+           DetectParaStyle is called in app.c), so an ordinary imported
+           paragraph would misidentify itself as Plain Text purely because
+           its named font didn't happen to be installed. Falling back to
+           this app's own default body font keeps imported text reading as
+           Normal (or whatever real style its size/bold/italic/underline
+           actually match) instead - the same fallback already used above
+           when the font table entry was empty to begin with. */
+        CToPascal("Times", pname);
+        GetFNum(pname, &fontID);
+    }
 
     memset(&ts, 0, sizeof(ts));
     ts.tsFont = fontID;
@@ -548,10 +620,10 @@ static void RtfPopGroup(RtfParser *rp)
 OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
 {
     short refNum;
-    long fileLen, count;
-    char *buf;
+    long fileLen;
     OSErr err;
     RtfParser rp;
+    RtfSrc rsrc;
     const char *p, *end;
     Boolean atGroupStart;
 
@@ -561,36 +633,35 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
     err = GetEOF(refNum, &fileLen);
     if (err != noErr) { FSClose(refNum); return err; }
 
-    /* This whole file gets malloc'd into one buffer up front (simplest way
-       to run a single-pass scanner over it). This sanity ceiling only
-       exists to refuse a clearly-doomed attempt (a many-megabyte file on
-       this app's much smaller heap - see the SIZE resource); it is
-       deliberately NOT trying to predict whether the file's *content* will
-       fit within RTF's own ~28,000-character import ceiling
-       (kRtfMaxImportChars) - that's enforced separately, per character, as
-       text is actually inserted (see the tooLarge handling below), and
-       lets a bigger source file still contribute a full, truncated-at-the-
-       limit import rather than being rejected outright just for being
-       large. If the allocation itself fails despite passing this check,
-       the NULL check right after is the real, precise safety net. */
-    if (fileLen > 1800000L) {
+    /* No whole-file buffer: the file is scanned in one left-to-right pass
+       through a small, fixed-size sliding window (see RtfEnsureLookahead
+       above), refilled from the still-open file as the scan consumes it.
+       Peak memory is bounded by that window plus the small growable
+       "pending run" buffer, regardless of the source file's size - a
+       multi-megabyte .rtf needs no more contiguous heap than a tiny one.
+       What's left here is a generous sanity ceiling, to avoid grinding
+       through a pathological file rather than for any memory reason;
+       kRtfMaxImportChars, the real *text*-level cap, is enforced
+       separately below as text is actually inserted. */
+    if (fileLen > 16000000L) {
         FSClose(refNum);
         return kImportTooLargeErr;
     }
 
-    buf = (char *)malloc(fileLen > 0 ? fileLen + 1 : 1);
-    if (!buf) {
+    rsrc.refNum = refNum;
+    rsrc.fileRemaining = fileLen;
+    rsrc.buf = (char *)malloc(kRtfChunkSize);
+    if (!rsrc.buf) {
         FSClose(refNum);
         return memFullErr;
     }
-    count = fileLen;
-    err = FSRead(refNum, &count, buf);
-    FSClose(refNum);
-    if (err != noErr) { free(buf); return err; }
-    buf[fileLen] = 0;
+    p = end = rsrc.buf;
+    err = RtfEnsureLookahead(&rsrc, &p, &end, 5);
+    if (err != noErr) { free(rsrc.buf); FSClose(refNum); return err; }
 
-    if (fileLen < 5 || strncmp(buf, "{\\rtf", 5) != 0) {
-        free(buf);
+    if (end - p < 5 || strncmp(p, "{\\rtf", 5) != 0) {
+        free(rsrc.buf);
+        FSClose(refNum);
         return paramErr;
     }
 
@@ -611,15 +682,17 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
     rp.ucSkip = 1;
     DBInit(&rp.pending);
 
-    p = buf;
-    end = buf + fileLen;
     atGroupStart = false;
 
-    while (p < end) {
-        char c = *p;
+    for (;;) {
+        char c;
 
-        if (rp.tooLarge)
-            break;
+        err = RtfEnsureLookahead(&rsrc, &p, &end, kRtfLookahead);
+        if (err != noErr) break;
+        if (p >= end) break;
+        if (rp.tooLarge) break;
+
+        c = *p;
 
         if (c == '{') {
             RtfPushGroup(&rp);
@@ -706,7 +779,20 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
             if (p < end && *p == ' ')
                 p++; /* a single trailing space is the delimiter, consumed */
 
-            if (rp.inFontTable && atGroupStart && RtfWordIs(wordStart, wlen, "f") && hasNum) {
+            if (rp.inFontTable && rp.skipDepth < 0 && RtfWordIs(wordStart, wlen, "f") && hasNum) {
+                /* Not gated on atGroupStart: a font table entry is only
+                   wrapped in its own {...} subgroup in *some* real-world
+                   RTF (`{\fonttbl{\f0\froman... Times New Roman;}}`) - other
+                   generators write it flat, with no subgroup between
+                   entries (`{\fonttbl\f0\froman... Times New Roman;\f1...}`).
+                   Requiring atGroupStart here missed \fN in the flat form
+                   (it only ever follows \fonttbl or a previous entry's `;`,
+                   never a fresh `{`), which left curFontSlot never set - so
+                   the font name text that follows fell through to the
+                   ordinary body-text path below and was inserted as
+                   garbled-looking literal characters at the very start of
+                   the imported document instead of being captured as a
+                   font name. */
                 short slot = (short)num;
                 if (slot >= 0 && slot < kRtfMaxFonts) {
                     rp.curFontSlot = slot;
@@ -761,8 +847,11 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
                     char mb = UnicodeToMacRomanByte(num);
                     short skip = rp.ucSkip;
                     RtfAppendByte(&rp, mb);
-                    while (skip > 0 && p < end) {
-                        if (*p == '\\' && p + 1 < end && p[1] == '\'') {
+                    while (skip > 0) {
+                        if (RtfEnsureLookahead(&rsrc, &p, &end, 8) != noErr)
+                            break;
+                        if (p >= end) break;
+                        if (*p == '\\' && p + 3 < end && p[1] == '\'') {
                             p += 4; /* \'hh fallback representation */
                         } else if (*p == '{' || *p == '}' || *p == '\\') {
                             break; /* don't eat real control structure */
@@ -797,7 +886,11 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
 
     RtfFlush(&rp);
     DBFree(&rp.pending);
-    free(buf);
+    free(rsrc.buf);
+    FSClose(refNum);
+
+    if (err != noErr)
+        return err;
 
     if (rp.tooLarge) {
         /* Keep whatever was inserted before the ceiling was hit. The caller

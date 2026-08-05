@@ -482,9 +482,38 @@ does handle:
   Calibri, not this app's own `\f0` = Times convention. Nested destinations
   within a font's own sub-group (e.g. `{\*\panose ...}`, common in
   Word-generated font tables) are correctly skipped without losing the rest
-  of that font's name — verified with a standalone test harness mirroring
-  the parser exactly, since this couldn't be tested live without an
-  emulator.
+  of that font's name.
+  A font-table entry is recognized purely by `\fN` occurring while inside
+  `\fonttbl` — **not** by also requiring it to sit right after a `{` (fixed
+  after a real report: some real-world RTF writes font-table entries flat,
+  `{\fonttbl\f0\froman\fcharset0 Times New Roman;\f1...}`, with no `{...}`
+  wrapping each one, rather than Word's usual
+  `{\fonttbl{\f0\froman...;}{\f1...;}}`. Requiring a fresh `{` missed `\fN`
+  in the flat form entirely — it only ever follows `\fonttbl` or the
+  previous entry's `;`, never a `{` — so the font *name* text that should
+  have been captured into the font table instead fell through to the
+  ordinary body-text path and was inserted as garbled-looking literal
+  characters at the very start of the imported document, e.g.
+  `Times New Roman;Arial;` ahead of the real content).
+  A font name that doesn't resolve to an installed font is also handled
+  explicitly now: `GetFNum` silently resolves an unmatched name to font ID
+  0 (the *system* font, Chicago) rather than failing outright, and a real
+  `.rtf`'s font table very often names fonts that only exist on whatever
+  machine authored it ("Times New Roman", "Calibri", "Arial", none of
+  which classic Mac OS ships) — but font ID 0 is *also* the exact signal
+  this app's own Style menu reads as "Plain Text" rather than "Normal"
+  (see wordproc.h's `ParaStyleSpec.systemFont` comment), so an ordinary
+  imported paragraph would silently misidentify itself as Plain Text
+  purely because its named font wasn't installed. `RtfFlush` now checks
+  for that and falls back to this app's own default body font (Times)
+  instead, the same fallback already used when a font table entry was
+  empty to begin with. Both of these were verified with a standalone host-
+  compiled harness that ran the *actual* production reader (linked
+  directly, not reimplemented) against small synthetic `.rtf` fixtures
+  covering both font-table styles and an unresolvable font name — checked
+  against the pre-fix code first to confirm each one reproduced the
+  reported symptom exactly, then against the fix to confirm it didn't,
+  since this couldn't be tested live without an emulator.
 - `\'hh` (literal hex-escaped byte) and `\uNNNN` (Unicode code point,
   best-effort mapped back through `kMacRomanHigh`, falling back to `?`) —
   including correctly skipping the `\ucN`-controlled fallback character(s)
@@ -497,30 +526,34 @@ does handle:
   (`colortbl`, `stylesheet`, `info`, `footnote`, `pict`, `object`,
   `header`/`footer` variants, `generator`).
 
-**Large/oversized files fail cleanly instead of crashing or corrupting.**
-`ReadDocumentFromRtf` reads the whole source file into one malloc'd buffer
-up front (simplest way to run a single-pass scanner over it) - on this
-app's small, fixed heap that allocation can genuinely fail for a large
-file, and originally wasn't checked for `NULL` at all, meaning `FSRead`
-would've been handed a null destination pointer. Handled in three layers:
-a generous-but-bounded file-size sanity check *before* attempting the
-allocation (1.8 MB - large enough to give genuinely big files a real shot,
-small enough to leave headroom under the 2 MB heap for everything else the
-app needs; rejects a clearly-doomed attempt outright rather than gambling
-on it), a `NULL` check on the allocation itself as the precise backstop if
-a file under that ceiling still doesn't fit, and a running check against
-`kRtfMaxImportChars` (28,000, matching the app's own `kSizeWarnThreshold`)
-as text is actually inserted during parsing - because RTF markup overhead
-makes a file's *byte size* a poor proxy for the *character count* it'll
-produce, so the real ceiling has to be enforced against what's actually
-being inserted, not guessed from the file size alone. All three return the
-same distinct `kImportTooLargeErr` (defined in `wordproc.h`, shared with
-`doc.c`'s reader below); the first two mean nothing was imported at all
-(there's no partial content yet to keep), but hitting the character
-ceiling *during* insertion is different and handled differently - see
-"Document size limit"'s "Import no longer discards a document just for
-being too long" for why that one keeps what was already inserted instead
-of throwing it away.
+**Large files don't need a large contiguous allocation at all.**
+`ReadDocumentFromRtf` never loads the source file into one buffer - it
+scans left to right through a small, fixed-size sliding window
+(`kRtfChunkSize`, 16 KB) refilled from the still-open file as the scan
+consumes it (`RtfEnsureLookahead`). Peak memory for the *source* side of
+import is that window plus the small growable "pending run" buffer,
+regardless of whether the file is 10 KB or 10 MB - a 1.5 MB `.rtf` needs
+no more contiguous heap than a 15 KB one. (This replaced an earlier
+design that malloc'd the whole file up front and asked `CompactMem` to
+approve it first; that worked, but meant the same file could succeed on
+one launch and fail on another purely because of how fragmented the
+heap happened to be at that moment - see "Import readers no longer need
+the whole file in memory" under "Document size limit" for why that was
+worth fixing instead of just tuning the size it asked for.) What's left
+is a generous byte-count sanity ceiling (16 MB) that only exists to avoid
+grinding through a pathological or corrupt file, not for any memory
+reason, plus a running check against `kRtfMaxImportChars` (28,000,
+matching the app's own `kSizeWarnThreshold`) as text is actually inserted
+during parsing, because RTF markup overhead makes a file's *byte size* a
+poor proxy for the *character count* it'll produce, so that ceiling has
+to be enforced against what's actually being inserted, not guessed from
+the file size. The sanity ceiling returns `kImportTooLargeErr` (defined
+in `wordproc.h`, shared with `doc.c`'s reader below) with nothing
+imported yet at that point (there's no partial content to keep), but
+hitting the character ceiling *during* insertion is different and
+handled differently - see "Document size limit"'s "Import no longer
+discards a document just for being too long" for why that one keeps what
+was already inserted instead of throwing it away.
 
 What it deliberately does **not** attempt: paragraph alignment, lists/
 tables, embedded pictures/objects, footnotes, and comments (the `\footnote`
@@ -584,19 +617,24 @@ caught a real bug introduced during the port (an uninitialized-variable
 mix-up between two similarly-named capacity counters in the FAT-building
 code) before it ever reached the actual application.
 
-Like the RTF reader, oversized files are rejected before attempting a
-large allocation (1.8 MB, the same sanity ceiling as RTF's - there's no
-strong reason for `.doc`'s to be different, since both are ultimately
-bounded by the same 2 MB heap regardless of which format's overhead
-dominates a given file's byte size), the allocation itself is
-`NULL`-checked, and text insertion is capped against the same practical
-TextEdit character ceiling (`kDocMaxImportChars`, also 28,000). All three
-return `kImportTooLargeErr` - but not all three mean the same thing to the
-caller: the two upfront checks mean nothing was imported (nothing to keep
-yet), while crossing the character ceiling *during* extraction keeps
-everything inserted before that point intact and lets `DoImport` treat it
-as a truncated-but-real partial import with a warning, rather than
-discarding it - see "Document size limit" for the reasoning.
+Like the RTF reader, the source file is never loaded into one buffer:
+every OLE2 structure (FAT sectors, the directory stream, the table
+stream, each text piece) is fetched directly from the still-open file
+with `SetFPos`+`FSRead`, sized to just what that structure needs -
+`Ole2ReadRange` is the one choke point everything else goes through, and
+the only thing genuinely proportional to the file's size afterward is the
+FAT link array itself (a handful of bytes per sector - a few KB even for
+a multi-megabyte document). What's left is a generous byte-count sanity
+ceiling (16 MB) that exists only to avoid grinding through a pathological
+or corrupt file, not for any memory reason, and text insertion is capped
+against the same practical TextEdit character ceiling
+(`kDocMaxImportChars`, also 28,000) - a fundamentally different kind of
+limit than a memory one, since it would apply even given infinite RAM.
+The sanity ceiling returns `kImportTooLargeErr` with nothing imported yet
+(nothing to keep), but crossing the character ceiling *during* extraction
+keeps everything inserted before that point intact and lets `DoImport`
+treat it as a truncated-but-real partial import with a warning, rather
+than discarding it - see "Document size limit" for the reasoning.
 
 ## How comments work
 
@@ -679,30 +717,111 @@ per-paragraph alignment, and, like that, deliberately out of scope for
 this pass.
 
 **The app's heap (`SIZE` resource: 512 KB min / 2 MB pref) is a separate
-thing from this 32,767-character ceiling, but matters for a different
-reason: Import.** `.rtf` and `.doc` readers each malloc the *whole source
-file* into memory up front to run their single-pass parsers over it (see
-"Importing foreign files" and "Reading real binary .doc files" below) -
-that allocation, not the 32,767-character limit, is what a bigger heap
-actually helps with, since it lets a larger source file be attempted at
-all before either reader even gets to the character-level ceiling. 2 MB
-preferred (rather than requesting more) is a deliberate choice: on a
-4 MB-RAM Mac, the System itself needs a meaningful share of that memory,
-so requesting a partition close to the machine's *total* RAM would be far
-less likely to actually be granted at launch than a more realistic 2 MB
-ask - a preference the Process Manager can't satisfy still lets the app
-launch with less, down to the 512 KB minimum, just with a smaller import
-ceiling.
+thing from this 32,767-character ceiling.** 2 MB preferred (rather than
+requesting more) is a deliberate choice: on a 4 MB-RAM Mac, the System
+itself needs a meaningful share of that memory, so requesting a partition
+close to the machine's *total* RAM would be far less likely to actually
+be granted at launch than a more realistic 2 MB ask - a preference the
+Process Manager can't satisfy still lets the app launch with less, down
+to the 512 KB minimum. Import used to be the main thing a bigger heap
+helped with, back when both readers malloc'd the whole source file into
+one block up front; now that they stream instead (see "Import readers no
+longer need the whole file in memory" below), the heap's size no longer
+gates how large an importable file can be - what it still budgets for is
+everything else running at once (the current document's own TE record
+and style table, Toolbox structures, the small fixed-size buffers the
+readers do still use).
 
-Reflecting that same ceiling everywhere it's checked: both readers use a
-generous but bounded upfront file-size sanity check (large enough to
-allow genuinely big source files a real attempt, small enough to leave
-headroom under the heap for everything else the app needs) before even
-attempting the allocation, and a `NULL` check on the allocation itself as
-the precise backstop if a given file doesn't fit despite passing that
-check - see "Large/oversized files fail cleanly instead of crashing or
-corrupting" above and its counterpart in "Reading real binary .doc files"
-for the exact numbers and reasoning.
+**Gotcha that actually crashed the app on launch, found the hard way:**
+the `'SIZE'` resource's last two fields are a preferred size and a minimum
+size, in that order - confirmed directly from the Rez template this
+toolchain compiles against (`multiversal/RIncludes/Multiverse.r`:
+`unsigned longint; // preferred` immediately followed by
+`unsigned longint; // minimum`). `src/main.r` had them **backwards**
+(`512 * 1024, 2 * 1024 * 1024` - smaller value first) essentially since
+this resource was first written, which silently told the Process Manager
+"prefer 512 KB, but require at least 2 MB to launch at all" - the exact
+opposite of the intended "512 KB minimum, 2 MB preferred." With a small
+gap between the two numbers (the project's very first values were 512 KB
+and 1 MB) this went unnoticed for a long time - whatever was actually
+available at launch was still probably at least 1 MB, so the app
+launched fine regardless of which field meant what. It only became fatal
+once the *preferred* figure was deliberately raised to 2 MB for larger
+Import allocations (see above): with the fields swapped, that 2 MB became
+the (backwards) *minimum*, and a machine without 2 MB free right at
+launch - before the app's own code, including anything to do with
+Import, ever got to run - would fail to start at all. Fixed by swapping
+the order to `2 * 1024 * 1024, 512 * 1024` with an explicit `/* preferred
+*/` / `/* minimum */` comment on each line, specifically so the order is
+never ambiguous again at a glance.
+
+**A second, unrelated launch crash (System error type 28 - stack
+overflow), found right after fixing the one above:** an experimental
+`TryMaximizeHeap()` had been added, called as the very first thing in
+`RunApp()`, that called `SetApplLimit((Ptr)someByteCount)` trying to ask
+for more memory at runtime. That's a fundamental misreading of what
+`SetApplLimit` does: it takes an *absolute memory address* marking where
+the heap zone should stop - normally computed as an offset from the zone's
+actual base or current limit, used to carve out guaranteed stack headroom
+*within* an already-granted partition - not a byte count to request more
+of. Passing a raw size like `4L * 1024L * 1024L` cast to a `Ptr` sets the
+heap ceiling to literal address `0x400000`, which has no relationship to
+where this app's partition actually sits in memory; depending on layout,
+that can shrink the heap zone to something nonsensical or corrupt the
+heap/stack boundary outright, and with it called before any other startup
+code, the failure surfaces as an immediate crash on launch with no chance
+for the app's own code to run first. There is no API for growing a
+partition after launch anyway - the `'SIZE'` resource fixed above is the
+*only* lever for that, and it's already correct - so the fix was simply
+deleting `TryMaximizeHeap()` entirely rather than trying to repair it.
+
+While tracking this down, `Document`'s `footnotes`/`comments` were also
+changed from fixed 200-entry arrays (`Footnote footnotes[200]`) to
+`malloc`'d pointers, allocated once in `CreateDocumentWindow`. Two
+200-entry arrays add real weight to the app's global data - and since
+`Document` is a global (`gDoc`), that competes directly with stack space
+in the same partition, same underlying concern as the heap-limit bug
+above, just via ordinary global storage instead of a botched API call.
+Most documents will never need anywhere near either array's full size, so
+reserving all of it as permanent global storage was already wasteful
+before this crash made it worth revisiting.
+
+**Import readers no longer need the whole file in memory, either.** Both
+`.rtf` and `.doc` import originally malloc'd the entire source file into
+one buffer up front, gated by asking `CompactMem` whether the current
+heap actually had a contiguous block that size free before committing to
+it. That was a real improvement over an unchecked malloc, but it was
+still fundamentally a bet: a 1 MB `.doc` could fail with "not enough
+memory" even on a launch that got the full 2 MB preferred partition,
+because *contiguous* free space is a function of everything else that's
+happened to the heap since launch (the current document's own TE record
+and style runs, Toolbox allocations, prior edits), not just the
+partition's total size - the same file could succeed right after
+launching and fail an hour into an editing session. Since neither reader
+actually needs random access to the *whole* file at once - RTF is parsed
+strictly left to right, and even OLE2's random-access container format
+only ever needs one sector, one stream, or one text piece at a time, not
+everything simultaneously - the fix was to stop needing the big
+allocation at all rather than to keep tuning how it's approved.
+`ReadDocumentFromRtf` now scans through a small fixed-size sliding window
+refilled from the still-open file as it goes (`RtfEnsureLookahead` in
+`src/rtf.c`); `ReadDocumentFromDoc` now fetches every OLE2 structure
+directly from the still-open file with `SetFPos`+`FSRead`
+(`Ole2ReadRange` in `src/doc.c`, the single choke point everything else
+funnels through). Both were checked with host-compiled differential
+tests before this landed: `RtfEnsureLookahead`'s window-refill logic was
+verified byte-for-byte lossless against plain sequential file reads,
+including under deliberately adversarial (near-degenerate) window sizes
+designed to force a refill at every possible boundary position; and the
+new file-seeking `Ole2ReadRange` was checked against the original
+buffer-based version across hundreds of randomized ranges over a
+synthetic, deliberately scrambled (non-contiguous) ~1.5 MB sector chain -
+the case most likely to expose an off-by-one in the sector-walking logic.
+What's left of the old checks is a generous byte-count sanity ceiling
+(16 MB for both readers) that exists only to avoid grinding through a
+pathological or corrupt file, not for any memory reason - see "Large
+files don't need a large contiguous allocation at all" above and its
+counterpart in "Reading real binary .doc files" for specifics.
 
 **Import no longer discards a document just for being too long to import
 in full.** Both `ReadDocumentFromRtf` and `ReadDocumentFromDoc` insert text

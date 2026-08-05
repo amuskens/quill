@@ -50,6 +50,17 @@
    being ported here, rather than trusted from memory alone - OLE2/MS-DOC
    are notoriously easy to get subtly wrong, and there was no way to test
    the ported C directly without an emulator.
+
+   Unlike a naive port of that Python prototype, nothing here ever reads
+   the whole source file into one buffer. Every structure (FAT sectors,
+   the directory stream, the table stream, each text piece) is fetched
+   directly from the still-open file with SetFPos+FSRead, sized to just
+   what that structure needs - see Ole2ReadRange below, the one choke
+   point all of it goes through. That keeps peak heap usage bounded to a
+   handful of small buffers regardless of the source file's size, instead
+   of needing one allocation as large as the whole file to sit in a single
+   contiguous free block - the failure this reader used to hit on ordinary
+   multi-hundred-KB documents once the heap had any fragmentation at all.
 */
 
 /* ---- little-endian byte readers (the file is little-endian; this target is 68k/big-endian) ---- */
@@ -101,13 +112,25 @@ typedef struct {
     long difatHead[kOle2DifatHeadCount];
 } Ole2Header;
 
-static OSErr Ole2ParseHeader(const unsigned char *buf, long len, Ole2Header *hdr)
+static OSErr Ole2ParseHeader(short refNum, long fileLen, Ole2Header *hdr)
 {
+    unsigned char buf[kOle2HeaderSize];
+    long count;
+    OSErr err;
     short i;
     unsigned short sectorShift;
 
-    if (len < kOle2HeaderSize)
+    if (fileLen < kOle2HeaderSize)
         return paramErr;
+
+    err = SetFPos(refNum, fsFromStart, 0);
+    if (err != noErr)
+        return err;
+    count = kOle2HeaderSize;
+    err = FSRead(refNum, &count, buf);
+    if (err != noErr)
+        return err;
+
     if (buf[0] != kOle2Signature0 || buf[1] != kOle2Signature1 ||
         buf[2] != kOle2Signature2 || buf[3] != kOle2Signature3)
         return paramErr;
@@ -137,8 +160,12 @@ static long Ole2SectorOffset(const Ole2Header *hdr, long sector)
    by sector number. The header carries the first 109 FAT-sector locations
    directly (difatHead); larger files chain additional "DIFAT" sectors
    (each a page of more FAT-sector locations, plus a link to the next
-   DIFAT sector in its last slot) to hold the rest. */
-static OSErr Ole2BuildFat(const unsigned char *buf, long len, const Ole2Header *hdr,
+   DIFAT sector in its last slot) to hold the rest. Each FAT/DIFAT sector
+   is fetched one at a time into a single reusable sector-sized buffer -
+   the resulting fat[] array itself (a few bytes per sector of the source
+   file) is the only allocation here that scales with file size, and it's
+   tiny even for a multi-megabyte document. */
+static OSErr Ole2BuildFat(short refNum, long fileLen, const Ole2Header *hdr,
                            long **outFat, long *outCount)
 {
     long *fatSectorIds;
@@ -149,10 +176,15 @@ static OSErr Ole2BuildFat(const unsigned char *buf, long len, const Ole2Header *
     long *fat;
     long fatEntryCount, fatWritePos;
     long i, s;
+    unsigned char *sectorBuf;
+    OSErr err;
+
+    sectorBuf = (unsigned char *)malloc(hdr->sectorSize);
+    if (!sectorBuf)
+        return memFullErr;
 
     fatSectorIds = (long *)malloc(sizeof(long) * fatSectorCap);
-    if (!fatSectorIds)
-        return memFullErr;
+    if (!fatSectorIds) { free(sectorBuf); return memFullErr; }
 
     for (i = 0; i < kOle2DifatHeadCount; i++) {
         if (hdr->difatHead[i] != kOle2FreeSect)
@@ -162,48 +194,66 @@ static OSErr Ole2BuildFat(const unsigned char *buf, long len, const Ole2Header *
     difatSec = hdr->firstDifatSector;
     while (difatSec >= 0) {
         long off = Ole2SectorOffset(hdr, difatSec);
-        if (off < 0 || off + hdr->sectorSize > len) { free(fatSectorIds); return paramErr; }
+        long readCount;
+        if (off < 0 || off + hdr->sectorSize > fileLen) { free(fatSectorIds); free(sectorBuf); return paramErr; }
+        err = SetFPos(refNum, fsFromStart, off);
+        if (err != noErr) { free(fatSectorIds); free(sectorBuf); return err; }
+        readCount = hdr->sectorSize;
+        err = FSRead(refNum, &readCount, sectorBuf);
+        if (err != noErr) { free(fatSectorIds); free(sectorBuf); return err; }
+
         if (fatSectorCount + entriesPerSector > fatSectorCap) {
             long newCap = fatSectorCap * 2 + entriesPerSector;
             long *grown = (long *)realloc(fatSectorIds, sizeof(long) * newCap);
-            if (!grown) { free(fatSectorIds); return memFullErr; }
+            if (!grown) { free(fatSectorIds); free(sectorBuf); return memFullErr; }
             fatSectorIds = grown;
             fatSectorCap = newCap;
         }
         for (i = 0; i < entriesPerSector - 1; i++) {
-            long v = ReadLE32Signed(buf + off + i * 4);
+            long v = ReadLE32Signed(sectorBuf + i * 4);
             if (v != kOle2FreeSect)
                 fatSectorIds[fatSectorCount++] = v;
         }
-        difatSec = ReadLE32Signed(buf + off + (entriesPerSector - 1) * 4);
+        difatSec = ReadLE32Signed(sectorBuf + (entriesPerSector - 1) * 4);
     }
 
     fatEntryCount = fatSectorCount * entriesPerSector;
-    if (fatEntryCount <= 0) { free(fatSectorIds); return paramErr; }
+    if (fatEntryCount <= 0) { free(fatSectorIds); free(sectorBuf); return paramErr; }
     fat = (long *)malloc(sizeof(long) * fatEntryCount);
-    if (!fat) { free(fatSectorIds); return memFullErr; }
+    if (!fat) { free(fatSectorIds); free(sectorBuf); return memFullErr; }
 
     fatWritePos = 0;
     for (s = 0; s < fatSectorCount; s++) {
         long off = Ole2SectorOffset(hdr, fatSectorIds[s]);
-        if (off < 0 || off + hdr->sectorSize > len) { free(fatSectorIds); free(fat); return paramErr; }
+        long readCount;
+        if (off < 0 || off + hdr->sectorSize > fileLen) { free(fatSectorIds); free(fat); free(sectorBuf); return paramErr; }
+        err = SetFPos(refNum, fsFromStart, off);
+        if (err != noErr) { free(fatSectorIds); free(fat); free(sectorBuf); return err; }
+        readCount = hdr->sectorSize;
+        err = FSRead(refNum, &readCount, sectorBuf);
+        if (err != noErr) { free(fatSectorIds); free(fat); free(sectorBuf); return err; }
         for (i = 0; i < entriesPerSector; i++)
-            fat[fatWritePos++] = ReadLE32Signed(buf + off + i * 4);
+            fat[fatWritePos++] = ReadLE32Signed(sectorBuf + i * 4);
     }
 
     free(fatSectorIds);
+    free(sectorBuf);
     *outFat = fat;
     *outCount = fatEntryCount;
     return noErr;
 }
 
 /* Reads exactly rangeLen bytes starting at rangeOffset within a FAT-chained
-   stream, into a caller-provided buffer - without ever materializing the
-   whole stream. Used for the (potentially large) WordDocument stream so
-   peak memory stays bounded to one piece's worth of text at a time,
+   stream, into a caller-provided buffer - fetched directly from the still-
+   open file sector by sector rather than copied out of an in-memory image
+   of the whole file. This is the single choke point every other reader in
+   this file goes through (directory, table stream, each text piece), which
+   is what lets the rest of doc.c stay ignorant of how the bytes are
+   actually sourced. Used for the (potentially large) WordDocument stream
+   so peak memory stays bounded to one piece's worth of text at a time,
    rather than the whole stream (which routinely holds far more than just
    the plain text - fonts, compatibility data, revision history). */
-static OSErr Ole2ReadRange(const unsigned char *buf, long len, const Ole2Header *hdr,
+static OSErr Ole2ReadRange(short refNum, long fileLen, const Ole2Header *hdr,
                             const long *fat, long fatCount, long startSector,
                             long rangeOffset, long rangeLen, unsigned char *outBuf)
 {
@@ -211,6 +261,7 @@ static OSErr Ole2ReadRange(const unsigned char *buf, long len, const Ole2Header 
     long skipSectors = rangeOffset / hdr->sectorSize;
     long offsetInSector = rangeOffset % hdr->sectorSize;
     long i, copied = 0;
+    OSErr err;
 
     for (i = 0; i < skipSectors; i++) {
         if (sec < 0 || sec >= fatCount) return paramErr;
@@ -220,11 +271,18 @@ static OSErr Ole2ReadRange(const unsigned char *buf, long len, const Ole2Header 
     while (copied < rangeLen) {
         long chunk = hdr->sectorSize - offsetInSector;
         long fileOff;
+        long chunkCount;
         if (sec < 0) return paramErr;
         if (chunk > rangeLen - copied) chunk = rangeLen - copied;
         fileOff = Ole2SectorOffset(hdr, sec) + offsetInSector;
-        if (fileOff < 0 || fileOff + chunk > len) return paramErr;
-        memcpy(outBuf + copied, buf + fileOff, chunk);
+        if (fileOff < 0 || fileOff + chunk > fileLen) return paramErr;
+
+        err = SetFPos(refNum, fsFromStart, fileOff);
+        if (err != noErr) return err;
+        chunkCount = chunk;
+        err = FSRead(refNum, &chunkCount, outBuf + copied);
+        if (err != noErr) return err;
+
         copied += chunk;
         offsetInSector = 0;
         if (copied < rangeLen) {
@@ -238,7 +296,7 @@ static OSErr Ole2ReadRange(const unsigned char *buf, long len, const Ole2Header 
 /* Materializes a whole FAT-chained stream - only used for streams known to
    be small (the directory stream, and 0Table/1Table, which hold formatting
    tables and the piece table, not the document's raw text). */
-static OSErr Ole2ReadWhole(const unsigned char *buf, long len, const Ole2Header *hdr,
+static OSErr Ole2ReadWhole(short refNum, long fileLen, const Ole2Header *hdr,
                             const long *fat, long fatCount, long startSector, long size,
                             unsigned char **outData)
 {
@@ -251,7 +309,7 @@ static OSErr Ole2ReadWhole(const unsigned char *buf, long len, const Ole2Header 
     if (!data)
         return memFullErr;
     if (size > 0) {
-        err = Ole2ReadRange(buf, len, hdr, fat, fatCount, startSector, 0, size, data);
+        err = Ole2ReadRange(refNum, fileLen, hdr, fat, fatCount, startSector, 0, size, data);
         if (err != noErr) { free(data); return err; }
     }
     *outData = data;
@@ -266,7 +324,7 @@ typedef struct {
     long size; /* low 32 bits only - fine, every stream this reader cares about is well under 4GB */
 } Ole2DirEntry;
 
-static OSErr Ole2ParseDirectory(const unsigned char *buf, long len, const Ole2Header *hdr,
+static OSErr Ole2ParseDirectory(short refNum, long fileLen, const Ole2Header *hdr,
                                  const long *fat, long fatCount,
                                  Ole2DirEntry **outEntries, long *outCount)
 {
@@ -293,7 +351,7 @@ static OSErr Ole2ParseDirectory(const unsigned char *buf, long len, const Ole2He
     raw = (unsigned char *)malloc(rawLen);
     if (!raw)
         return memFullErr;
-    err = Ole2ReadRange(buf, len, hdr, fat, fatCount, hdr->firstDirSector, 0, rawLen, raw);
+    err = Ole2ReadRange(refNum, fileLen, hdr, fat, fatCount, hdr->firstDirSector, 0, rawLen, raw);
     if (err != noErr) { free(raw); return err; }
 
     n = rawLen / kOle2DirEntrySize;
@@ -464,8 +522,6 @@ OSErr ReadDocumentFromDoc(Document *doc, const FSSpec *src)
 {
     short refNum;
     long fileLen;
-    unsigned char *fileBuf = NULL;
-    long count;
     OSErr err;
     Ole2Header hdr;
     long *fat = NULL;
@@ -491,53 +547,39 @@ OSErr ReadDocumentFromDoc(Document *doc, const FSSpec *src)
     err = GetEOF(refNum, &fileLen);
     if (err != noErr) { FSClose(refNum); return err; }
 
-    /* Whole file is read into one buffer, same tradeoff as rtf.c's reader -
-       simplest way to run the container parser, at the cost of needing
-       the file to fit in one contiguous block. This is a sanity ceiling
-       against a clearly-doomed attempt (many megabytes on this app's much
-       smaller heap - see the SIZE resource), not a prediction of whether
-       the file's *text* will fit: a real .doc's byte size is dominated by
-       internal structure overhead (fonts, compatibility data, revision
-       history), not the plain text it'll produce, and that text-level
-       limit (kDocMaxImportChars) is enforced separately, per piece, as
-       text is actually extracted below - so a large source file still
-       contributes a full, truncated-at-the-limit import rather than being
-       turned away outright just for being large. The NULL check right
-       after the allocation is the real, precise safety net if this file
-       does turn out not to fit despite passing this check. */
-    if (fileLen > 1800000L) { FSClose(refNum); return kImportTooLargeErr; }
+    /* No whole-file buffer: every structure below is fetched straight from
+       this still-open file (see Ole2ReadRange), so the size that matters
+       for memory purposes is never the file's - it's the largest single
+       piece of text extracted at a time, further down. What's left here is
+       a generous sanity ceiling to avoid grinding through a pathological
+       or corrupt file, not a memory-driven one; kDocMaxImportChars is the
+       real, *text*-level cap, enforced separately below. */
+    if (fileLen > 16000000L) { FSClose(refNum); return kImportTooLargeErr; }
 
-    fileBuf = (unsigned char *)malloc(fileLen > 0 ? fileLen : 1);
-    if (!fileBuf) { FSClose(refNum); return memFullErr; }
-    count = fileLen;
-    err = FSRead(refNum, &count, fileBuf);
-    FSClose(refNum);
-    if (err != noErr) { free(fileBuf); return err; }
+    err = Ole2ParseHeader(refNum, fileLen, &hdr);
+    if (err != noErr) { FSClose(refNum); return err; }
 
-    err = Ole2ParseHeader(fileBuf, fileLen, &hdr);
-    if (err != noErr) { free(fileBuf); return err; }
+    err = Ole2BuildFat(refNum, fileLen, &hdr, &fat, &fatCount);
+    if (err != noErr) { FSClose(refNum); return err; }
 
-    err = Ole2BuildFat(fileBuf, fileLen, &hdr, &fat, &fatCount);
-    if (err != noErr) { free(fileBuf); return err; }
+    err = Ole2ParseDirectory(refNum, fileLen, &hdr, fat, fatCount, &entries, &entryCount);
+    if (err != noErr) { free(fat); FSClose(refNum); return err; }
 
-    err = Ole2ParseDirectory(fileBuf, fileLen, &hdr, fat, fatCount, &entries, &entryCount);
-    if (err != noErr) { free(fat); free(fileBuf); return err; }
-
-    if (entryCount == 0) { free(entries); free(fat); free(fileBuf); return paramErr; }
+    if (entryCount == 0) { free(entries); free(fat); FSClose(refNum); return paramErr; }
 
     wdocIdx = Ole2FindByName(entries, entryCount, entries[0].child, "WordDocument");
     if (wdocIdx < 0 || entries[wdocIdx].size < kOle2MinStreamSize) {
-        free(entries); free(fat); free(fileBuf);
+        free(entries); free(fat); FSClose(refNum);
         return paramErr; /* not a Word document, or too small/oddly-structured to be one this reader handles */
     }
 
     /* Read just enough of the FIB header to reach fibRgFcLcb97[kFibClxIndex]. */
-    err = Ole2ReadRange(fileBuf, fileLen, &hdr, fat, fatCount, entries[wdocIdx].startSector,
+    err = Ole2ReadRange(refNum, fileLen, &hdr, fat, fatCount, entries[wdocIdx].startSector,
                          0, sizeof(fibHead), fibHead);
-    if (err != noErr) { free(entries); free(fat); free(fileBuf); return err; }
+    if (err != noErr) { free(entries); free(fat); FSClose(refNum); return err; }
 
     if (ReadLE16(fibHead) != kFibIdent) {
-        free(entries); free(fat); free(fileBuf);
+        free(entries); free(fat); FSClose(refNum);
         return paramErr;
     }
     flags1 = ReadLE16(fibHead + 10);
@@ -545,24 +587,24 @@ OSErr ReadDocumentFromDoc(Document *doc, const FSSpec *src)
 
     tblIdx = Ole2FindByName(entries, entryCount, entries[0].child, whichTblStm ? "1Table" : "0Table");
     if (tblIdx < 0 || entries[tblIdx].size < kOle2MinStreamSize) {
-        free(entries); free(fat); free(fileBuf);
+        free(entries); free(fat); FSClose(refNum);
         return paramErr;
     }
 
     fcClx = (long)ReadLE32(fibHead + kFibRgFcLcbOffset + kFibClxIndex * 8);
     lcbClx = (long)ReadLE32(fibHead + kFibRgFcLcbOffset + kFibClxIndex * 8 + 4);
     if (lcbClx <= 0 || lcbClx > 200000L || fcClx < 0 || fcClx + lcbClx > entries[tblIdx].size) {
-        free(entries); free(fat); free(fileBuf);
+        free(entries); free(fat); FSClose(refNum);
         return paramErr;
     }
 
-    err = Ole2ReadWhole(fileBuf, fileLen, &hdr, fat, fatCount, entries[tblIdx].startSector,
+    err = Ole2ReadWhole(refNum, fileLen, &hdr, fat, fatCount, entries[tblIdx].startSector,
                          entries[tblIdx].size, &tblData);
-    if (err != noErr) { free(entries); free(fat); free(fileBuf); return err; }
+    if (err != noErr) { free(entries); free(fat); FSClose(refNum); return err; }
 
     err = ExtractPieceTable(tblData + fcClx, lcbClx, &pieces, &pieceCount);
     free(tblData);
-    if (err != noErr) { free(entries); free(fat); free(fileBuf); return err; }
+    if (err != noErr) { free(entries); free(fat); FSClose(refNum); return err; }
 
     memset(&ts, 0, sizeof(ts));
     ts.tsFont = systemFont; /* see wordproc.h's ParaStyleSpec.systemFont comment - imported plain text isn't Times-styled Normal */
@@ -596,7 +638,7 @@ OSErr ReadDocumentFromDoc(Document *doc, const FSSpec *src)
             break;
         }
 
-        err = Ole2ReadRange(fileBuf, fileLen, &hdr, fat, fatCount, entries[wdocIdx].startSector,
+        err = Ole2ReadRange(refNum, fileLen, &hdr, fat, fatCount, entries[wdocIdx].startSector,
                              pc->byteOff, byteLen, raw);
         if (err != noErr) { free(raw); free(plain); break; }
 
@@ -623,7 +665,7 @@ OSErr ReadDocumentFromDoc(Document *doc, const FSSpec *src)
     free(pieces);
     free(entries);
     free(fat);
-    free(fileBuf);
+    FSClose(refNum);
 
     /* A mid-extraction failure or hitting the size ceiling still leaves
        whatever was inserted before it in the window - the caller (DoImport)
