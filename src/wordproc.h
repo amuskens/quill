@@ -9,6 +9,16 @@
 #define kMaxFootnotes 200
 #define kMaxComments 200
 
+/* A distinct, app-specific error code (well clear of any real classic Mac
+   OS error range) so DoImport can show a size-specific message instead of
+   the generic "could not be imported" - returned by both ReadDocumentFromRtf
+   and ReadDocumentFromDoc when the source file is rejected by size up
+   front, or when inserting its content would cross their respective
+   character-count ceilings partway through parsing. Shared here (rather
+   than defined separately in rtf.h/doc.h) since app.c's DoImport needs to
+   check for it regardless of which reader produced it. */
+#define kImportTooLargeErr (-9000)
+
 /* CopyCStringToPascal/CopyPascalStringToC are Carbon-only in this toolchain;
    these are the 68k-safe equivalents. */
 static void CToPascal(const char *src, unsigned char *dst)

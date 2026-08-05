@@ -6,6 +6,7 @@ add_application(Quill
     src/app.c
     src/docx.c
     src/rtf.c
+    src/doc.c
     src/native.c
     src/zip.c
     src/main.r

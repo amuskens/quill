@@ -15,6 +15,7 @@
 #include "wordproc.h"
 #include "docx.h"
 #include "rtf.h"
+#include "doc.h"
 #include "native.h"
 
 enum {
@@ -591,6 +592,31 @@ static void DoOpen(void)
    StandardGetFile call, same reasoning as DoOpen - a file brought over from
    a modern system won't reliably carry meaningful classic Mac type codes,
    so content sniffing is the only reliable signal. */
+typedef enum { kImportRtf, kImportOle2Doc, kImportUnknown } ImportKind;
+
+/* Reports why a ReadDocumentFrom{Rtf,Doc} failure happened, in terms
+   specific enough to actually act on - "could not be imported" alone
+   doesn't tell anyone whether to try a smaller file, free up memory, or
+   give up on that particular file entirely. */
+static void FailImportError(OSErr err, Boolean isDoc)
+{
+    if (err == kImportTooLargeErr) {
+        Fail("That file is too large to import - classic TextEdit has a "
+             "hard limit around 28,000 characters, and this file would "
+             "exceed it.");
+    } else if (err == memFullErr) {
+        Fail("Not enough memory to import that file.");
+    } else if (isDoc) {
+        Fail("That file could not be imported - its internal structure "
+             "wasn\xd5t recognized. Only Word 97-2003 format is supported, "
+             "and only its plain text, not real binary Word documents in "
+             "general.");
+    } else {
+        Fail("That file could not be imported - its RTF content could not "
+             "be read.");
+    }
+}
+
 static void DoImport(void)
 {
     StandardFileReply reply;
@@ -598,6 +624,7 @@ static void DoImport(void)
     long fileLen, count;
     char head[8];
     OSErr err;
+    ImportKind kind;
 
     StandardGetFile(NULL, -1, NULL, &reply);
     if (!reply.sfGood)
@@ -618,36 +645,48 @@ static void DoImport(void)
     FSRead(refNum, &count, head);
     FSClose(refNum);
 
-    if (!(count >= 5 && strncmp(head, "{\\rtf", 5) == 0)) {
+    if (count >= 5 && strncmp(head, "{\\rtf", 5) == 0) {
+        kind = kImportRtf;
+    } else if (count >= 4 && (unsigned char)head[0] == 0xD0 &&
+               (unsigned char)head[1] == 0xCF && (unsigned char)head[2] == 0x11 &&
+               (unsigned char)head[3] == 0xE0) {
+        kind = kImportOle2Doc;
+    } else {
+        kind = kImportUnknown;
+    }
+
+    if (kind == kImportUnknown) {
         if (count >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 3 && head[3] == 4) {
             Fail("That looks like a .docx file. Importing .docx isn\xd5t "
-                 "supported yet \xd0 only .rtf files, and .doc files that "
-                 "are actually RTF content, can be imported.");
-        } else if (count >= 4 && (unsigned char)head[0] == 0xD0 &&
-                   (unsigned char)head[1] == 0xCF && (unsigned char)head[2] == 0x11 &&
-                   (unsigned char)head[3] == 0xE0) {
-            Fail("That's a real binary Word (.doc) file, which this app "
-                 "can\xd5t parse \xd0 only .rtf files, and .doc files that "
-                 "are actually RTF content, can be imported.");
+                 "supported yet \xd0 only .rtf files, and .doc files (real "
+                 "binary Word 97-2003, or files that are actually RTF "
+                 "content), can be imported.");
         } else {
-            Fail("That file doesn\xd5t look like RTF. Only .rtf files, and "
-                 ".doc files that are actually RTF content, can be imported.");
+            Fail("That file doesn\xd5t look like RTF or a binary Word "
+                 "document. Only .rtf files and .doc files can be imported.");
         }
         return;
     }
 
-    Warn("Import is best-effort: only text, bold, italic, underline, font, "
-         "and size are recovered. Paragraph alignment, lists, tables, "
-         "footnotes, and embedded objects are not imported.");
+    if (kind == kImportRtf) {
+        Warn("Import is best-effort: only text, bold, italic, underline, "
+             "font, and size are recovered. Paragraph alignment, lists, "
+             "tables, footnotes, and embedded objects are not imported.");
+    } else {
+        Warn("This is a real binary Word document. Import recovers plain "
+             "text only \xd0 no bold, italic, underline, fonts, styles, "
+             "footnotes, comments, tables, or embedded objects.");
+    }
 
     TESetSelect(0, 32767, gDoc.body);
     TEDelete(gDoc.body);
     ClearFootnotes();
     ClearComments();
 
-    err = ReadDocumentFromRtf(&gDoc, &reply.sfFile);
+    err = (kind == kImportRtf) ? ReadDocumentFromRtf(&gDoc, &reply.sfFile)
+                                : ReadDocumentFromDoc(&gDoc, &reply.sfFile);
     if (err != noErr) {
-        Fail("That file could not be imported.");
+        FailImportError(err, (Boolean)(kind == kImportOle2Doc));
         DoNew();
         return;
     }

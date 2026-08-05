@@ -74,8 +74,10 @@ on 68k System 7 (or Mini vMac).
     actually RTF" below.
 - **Open…**: reads `.qdoc` files back (only — see Known limitations for why
   `.docx`/`.rtf`/`.doc` remain write-only via Save As).
-- **Import…**: best-effort import of `.rtf` files, and `.doc` files that are
-  actually RTF content — see "Importing foreign files" below.
+- **Import…**: best-effort import of `.rtf` files, `.doc` files that are
+  actually RTF content, and genuine binary Word 97-2003 `.doc`/`.dot` files
+  (plain text only for the latter) — see "Importing foreign files" and
+  "Reading real binary .doc files" below.
 - **Save-changes confirmation**: New, Open, and Quit all check `gDoc.dirty`
   first and, if there are unsaved changes, show a Save / Cancel / Don't Save
   dialog before proceeding — picking Save runs the normal save flow (Save
@@ -448,19 +450,21 @@ freshly built disk image.
 
 ## Importing foreign files
 
-File → Import… (`DoImport` in `app.c`) opens `.rtf` files, and `.doc` files
-that turn out to actually be RTF content — a real, common case, since this
-app's own "Save As .doc" produces exactly that (see "Why .doc is actually
-RTF" below), and plenty of real-world `.doc` files in the wild are the same.
-The file is identified by **content, not name or extension**: the first
-bytes are checked for the RTF magic (`{\rtf`), so a `.doc` that's genuinely
-RTF opens correctly while one that isn't gets a clear rejection message
-instead of silently importing garbage. A `.docx` (ZIP magic `PK\3\4`) or
-genuine binary `.doc` (OLE2/CFB magic) is detected the same way and
-rejected with an explanation of why, rather than pretending to support it.
-Before the import actually runs, a warning explains that only text plus
-bold/italic/underline/font/size are recovered — this is genuinely a
-best-effort reader, not a full RTF implementation.
+File → Import… (`DoImport` in `app.c`) opens `.rtf` files, `.doc` files that
+turn out to actually be RTF content (a real, common case, since this app's
+own "Save As .doc" produces exactly that - see "Why .doc is actually RTF"
+below), and genuine binary `.doc`/`.dot` files (Word 97-2003 / OLE2 format -
+see "Reading real binary .doc files" below). The file's actual *kind* is
+identified by **content, not name or extension**: the first bytes are
+checked for the RTF magic (`{\rtf`) and the OLE2 magic (`D0 CF 11 E0...`),
+so a `.doc` that's genuinely RTF and a `.doc` that's a real binary Word
+document are each routed to the reader that actually understands them,
+rather than either one getting silently mishandled. A `.docx` (ZIP magic
+`PK\3\4`) is detected the same way and rejected with an explanation of why,
+rather than pretending to support it (see "Known limitations"). Before
+either import actually runs, a warning explains what will and won't be
+recovered - this is genuinely a best-effort pair of readers, not full
+implementations of either format.
 
 `ReadDocumentFromRtf` (`src/rtf.c`) is a hand-rolled RTF tokenizer, not a
 parser for the whole spec — RTF's own design makes that a reasonable
@@ -492,6 +496,26 @@ does handle:
   (`colortbl`, `stylesheet`, `info`, `footnote`, `pict`, `object`,
   `header`/`footer` variants, `generator`).
 
+**Large/oversized files fail cleanly instead of crashing or corrupting.**
+`ReadDocumentFromRtf` reads the whole source file into one malloc'd buffer
+up front (simplest way to run a single-pass scanner over it) - on this
+app's small, fixed heap that allocation can genuinely fail for a large
+file, and originally wasn't checked for `NULL` at all, meaning `FSRead`
+would've been handed a null destination pointer. Fixed with three layers:
+a file-size check *before* attempting the allocation (rejects with a clear
+message rather than gambling on a large malloc succeeding), a `NULL` check
+on the allocation itself as a backstop, and a running check against
+`kRtfMaxImportChars` (28,000, matching the app's own `kSizeWarnThreshold`)
+as text is actually inserted during parsing - because RTF markup overhead
+makes a file's *byte size* a poor proxy for the *character count* it'll
+produce, so the real ceiling has to be enforced against what's actually
+being inserted, not guessed from the file size alone. Hitting any of these
+returns a distinct `kImportTooLargeErr` (defined in `wordproc.h`, shared
+with `doc.c`'s reader below) so `DoImport` can show a specific "too large"
+message instead of a generic "could not be imported" one, and discards
+whatever was partially inserted rather than leaving a truncated document in
+the window.
+
 What it deliberately does **not** attempt: paragraph alignment, lists/
 tables, embedded pictures/objects, footnotes, and comments (the `\footnote`
 and `\*\annotation` groups are both skipped rather than reconstructed as
@@ -499,6 +523,69 @@ real Quill footnotes/comments — recovering the anchor position correctly
 would need more bookkeeping than this pass covers). Imported content is
 treated as a new, unsaved document — `File → Save` offers Save As `.qdoc`,
 it does not silently overwrite the original `.rtf`/`.doc` file.
+
+## Reading real binary .doc files
+
+`ReadDocumentFromDoc` (`src/doc.c`) reads genuine Word 97-2003 binary `.doc`
+(and `.dot` template) files - the actual OLE2-based format, not RTF wearing
+a `.doc` extension. **Plain text only**: no bold/italic/underline/font, no
+paragraph styles, no footnotes/comments/fields/tables/pictures. Recovering
+formatting would mean parsing Word's own CHPX/PAPX property structures
+(run-length-encoded lists of "sprm" opcodes) on top of everything already
+needed just to reach the text - a substantial second undertaking,
+deliberately out of scope for this pass.
+
+Two independent formats are involved, and both had to be implemented from
+scratch:
+
+- **OLE2 / Compound File Binary Format**, the container. It's a small
+  filesystem embedded in one file - 512-byte sectors, a FAT (File
+  Allocation Table - the same "linked list of blocks" idea as a real disk
+  FAT) locating a directory stream, and the directory stream listing named
+  streams (`WordDocument`, and `0Table` or `1Table` depending on a flag in
+  the FIB) each with their own starting sector and size. Streams below a
+  cutoff size (always 4096 bytes) live in a separate "mini stream" with its
+  own smaller-sector FAT - deliberately **not supported**: a real
+  document's `WordDocument`/table streams are essentially always well
+  above that cutoff, and implementing mini-stream random access would
+  roughly double this reader's size for a case that's never actually hit in
+  practice. Directory entries form a red-black tree (sibling + child
+  pointers) rather than a flat list; walked as a plain binary tree since
+  only lookup-by-name is needed, not the balancing semantics.
+- **Word's own binary layout** within the `WordDocument` stream: a FIB
+  (File Information Block) header, and - reached through it - a piece
+  table (an array of "pieces", each a contiguous run of text stored either
+  as 8-bit "compressed" Windows-1252 or 16-bit Unicode UTF-16LE, at some
+  byte offset elsewhere in the same stream). Paragraph marks are literal
+  `\r` characters *within* the piece text, the same convention this app's
+  own TE buffers already use - plain-text extraction doesn't need to do
+  anything special for paragraph breaks. Field codes (mail-merge-style,
+  wrapped in `0x13`/`0x14`/`0x15` marker bytes) and footnote/endnote
+  reference marks are passed through as literal characters rather than
+  specially interpreted, for the same "best effort, text only" reasoning
+  as RTF import's handling of unrecognized control words.
+
+**Verified against a real, complex, real-world `.dot` file** (a multi-page
+document with footnotes-adjacent formatting, mixed compressed/Unicode
+pieces, and several non-ASCII characters) using the same method as the RTF
+reader's font-table logic: prototyped and checked against the file's actual
+bytes in Python first (confirming the single most error-prone number in
+this whole reader - which index into the FIB's `fibRgFcLcb97` array holds
+the piece table's location - against real data rather than trusting it from
+memory), then the ported C was itself compiled standalone and re-run
+against the same file as a second, independent check. That second pass
+caught a real bug introduced during the port (an uninitialized-variable
+mix-up between two similarly-named capacity counters in the FAT-building
+code) before it ever reached the actual application.
+
+Like the RTF reader, oversized files are rejected before attempting a
+large allocation (the ceiling here is deliberately higher and independent
+of the RTF one - a `.doc` file's byte size is dominated by internal
+structure overhead like fonts and revision history, not the plain text it
+produces), the allocation itself is `NULL`-checked, and text insertion is
+capped against the same practical TextEdit character ceiling, all
+returning `kImportTooLargeErr` for a specific, honest error message rather
+than a crash or a silent truncation.
 
 ## How comments work
 
@@ -670,15 +757,17 @@ necessary.
 ## Known limitations
 
 - **Open only reads `.qdoc`**; `.docx`/`.rtf`/`.doc` remain write-only via
-  Save As. **Import (File → Import…) reads `.rtf`, and `.doc` files that are
+  Save As. **Import (File → Import…) reads `.rtf`, `.doc` files that are
   actually RTF content** (as this app's own "Save As .doc" produces, and as
-  many real-world `.doc` files turn out to be) — see "Importing foreign
-  files" below for exactly what is/isn't recovered, and why genuine binary
-  `.doc` and `.docx` aren't handled (real `.docx` needs a from-scratch
-  DEFLATE decompressor to be useful at all, since Word always compresses its
-  ZIP entries — a large, error-prone undertaking deliberately deferred; real
-  binary `.doc` is OLE2/CFB, out of scope for the same reason described under
-  "Why .doc is actually RTF" below).
+  many real-world `.doc` files turn out to be), **and genuine binary Word
+  97-2003 `.doc`/`.dot` files** (plain text only — no formatting) — see
+  "Importing foreign files" and "Reading real binary .doc files" below for
+  exactly what is/isn't recovered. `.docx` is still not handled: real
+  `.docx` needs a from-scratch DEFLATE decompressor to be useful at all,
+  since Word always compresses its ZIP entries — a large, error-prone
+  undertaking deliberately deferred (see "DOCX import scope" discussion -
+  this was a deliberate choice, not an oversight, given real binary `.doc`
+  turned out to be tractable enough to implement instead).
 - **No true superscript on-screen**: classic TextEdit's style byte has bits
   for bold/italic/underline/outline/shadow/condense/extend and nothing else
   — there's no baseline-shift or superscript concept at the Toolbox level.

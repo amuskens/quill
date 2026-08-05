@@ -23,8 +23,11 @@ OSErr WriteDocumentAsRtf(Document *doc, const FSSpec *dest, Boolean includeComme
    are dropped rather than reconstructed). Also the path used for importing
    a ".doc" file that's actually RTF content (as this app's own "Save As
    .doc" produces, and as many real .doc files in the wild are) - see
-   DoImport's content-sniffing. Genuine binary OLE2 .doc is not handled;
-   see the README's "Why .doc is actually RTF". */
+   DoImport's content-sniffing. Genuine binary OLE2 .doc goes through
+   doc.c's separate reader instead - see its header comment. Returns
+   kImportTooLargeErr (defined in wordproc.h, shared with doc.c) if the
+   file is (or would produce) too much text for classic TextEdit's
+   character limit - see kRtfMaxImportChars in rtf.c. */
 OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src);
 
 #endif

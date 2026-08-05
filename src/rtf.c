@@ -409,7 +409,19 @@ typedef struct {
     RtfRunState pendingState;
 
     short ucSkip; /* plain fallback chars to skip after \uN - \ucN sets this, default 1 */
+
+    Boolean tooLarge; /* set once insertPos would cross kRtfMaxImportChars; the main loop bails out when this is set */
 } RtfParser;
+
+/* Classic TextEdit's selStart/selEnd/teLength are 16-bit INTEGERs (see the
+   README's "Document size limit") - inserting text that pushes the total
+   past ~32,767 characters doesn't fail cleanly, it wraps/corrupts those
+   fields. RTF markup overhead means a file's byte size is a poor proxy for
+   the plain-text character count it'll actually produce, so this is
+   checked against the running insertPos as text is actually inserted,
+   not against the source file's size up front. Kept a safety margin below
+   the hard ceiling, matching the app's own kSizeWarnThreshold. */
+#define kRtfMaxImportChars 28000
 
 static int RtfHexVal(char c)
 {
@@ -452,6 +464,16 @@ static void RtfFlush(RtfParser *rp)
 
     if (rp->pending.len == 0)
         return;
+
+    if (rp->tooLarge) {
+        rp->pending.len = 0; /* already past the limit - discard instead of inserting further */
+        return;
+    }
+    if (rp->insertPos + (long)rp->pending.len > kRtfMaxImportChars) {
+        rp->tooLarge = true;
+        rp->pending.len = 0;
+        return;
+    }
 
     TESetSelect(rp->insertPos, rp->insertPos, rp->doc->body);
     TEInsert(rp->pending.data, (long)rp->pending.len, rp->doc->body);
@@ -538,7 +560,26 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
         return err;
     err = GetEOF(refNum, &fileLen);
     if (err != noErr) { FSClose(refNum); return err; }
+
+    /* This whole file gets malloc'd into one buffer up front (simplest way
+       to run a single-pass scanner over it) - on this app's small, fixed
+       heap (see the SIZE resource) that can genuinely fail for a large
+       file, long before RTF's own ~28,000-character import ceiling
+       (kRtfMaxImportChars) would ever come into play. Rejected by size
+       here, before attempting the allocation, rather than finding out via
+       a NULL malloc return - a generous ceiling given RTF markup overhead
+       (worst case, heavy \uNNNN? escaping) can inflate byte size well past
+       the eventual character count. */
+    if (fileLen > 500000) {
+        FSClose(refNum);
+        return kImportTooLargeErr;
+    }
+
     buf = (char *)malloc(fileLen > 0 ? fileLen + 1 : 1);
+    if (!buf) {
+        FSClose(refNum);
+        return memFullErr;
+    }
     count = fileLen;
     err = FSRead(refNum, &count, buf);
     FSClose(refNum);
@@ -573,6 +614,9 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
 
     while (p < end) {
         char c = *p;
+
+        if (rp.tooLarge)
+            break;
 
         if (c == '{') {
             RtfPushGroup(&rp);
@@ -751,6 +795,15 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
     RtfFlush(&rp);
     DBFree(&rp.pending);
     free(buf);
+
+    if (rp.tooLarge) {
+        /* Whatever was inserted before the ceiling was hit is a truncated,
+           confusing partial document, not a usable result - discard it
+           rather than leaving it in the window. */
+        TESetSelect(0, 32767, doc->body);
+        TEDelete(doc->body);
+        return kImportTooLargeErr;
+    }
 
     TESetSelect(0, 0, doc->body);
     return noErr;
