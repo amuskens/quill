@@ -89,6 +89,7 @@ static Point gLastClickPt = { 0, 0 };
 static Boolean gSizeWarningShown = false;
 
 static void ToolboxInit(void);
+static void TryMaximizeHeap(void);
 static void SetupMenus(void);
 static void CreateDocumentWindow(void);
 static void LayoutContent(Rect *viewRectOut, Rect *scrollRectOut);
@@ -152,6 +153,58 @@ static void ToolboxInit(void)
     TEInit();
     InitDialogs(NULL);
     InitCursor();
+}
+
+/* Best-effort attempt to grow the application partition at startup.
+   Strategy:
+   - Prefer to set the application's limit to 4 MiB using SetApplLimit.
+   - If that fails or the actual usable heap is still small, probe by
+     attempting progressively smaller allocations (NewPtr) to discover
+     a large allocatable block. If a probe of size S succeeds, attempt
+     to set the application limit to 2*S (approximate making that block
+     represent ~50%% of the partition).
+
+   This is intentionally conservative and best-effort: the Memory Manager
+   / OS (or the emulator) ultimately decides how much to grant. */
+static void TryMaximizeHeap(void)
+{
+    const long kMaxRequested = 4L * 1024L * 1024L; /* 4 MB */
+    const long kMinProbe = 4 * 1024; /* 4 KB smallest probe */
+    OSErr err;
+
+    /* First, ask the system for the full 4MB partition. If the system can
+       satisfy it, great. On many hosts/emulators this may fail if the
+       guest has less physical RAM configured. */
+    err = SetApplLimit(kMaxRequested);
+    (void)err; /* ignore result - we'll probe below to see what actually works */
+
+    /* Probe: try to allocate a single contiguous block of up to half of
+       the requested max (i.e., 2 MB). If that fails, halve and retry until
+       a small threshold. */
+    long probe = kMaxRequested / 2;
+    while (probe >= kMinProbe) {
+        Ptr p = NewPtr((Size)probe);
+        if (p != NULL) {
+            /* allocation succeeded: free it and try to set appl limit to
+               twice the probe size (so the probe represents ~50% of the
+               requested partition). If SetApplLimit fails, ignore it - at
+               least the large allocation succeeded which means usable heap
+               is already large enough for that probe. */
+            DisposPtr(p);
+            long desiredLimit = probe * 2;
+            if (desiredLimit > kMaxRequested)
+                desiredLimit = kMaxRequested;
+            err = SetApplLimit(desiredLimit);
+            (void)err;
+            return;
+        }
+        probe /= 2; /* try a smaller probe */
+    }
+
+    /* If we get here, every probe failed - can't allocate even a small
+       multi-kilobyte block beyond current usage. Give up silently; the
+       app will run with its existing partition (SIZE resource still in
+       effect). */
 }
 
 static void SetupMenus(void)
@@ -1644,6 +1697,9 @@ void RunApp(void)
     EventRecord event;
 
     ToolboxInit();
+    /* Try to grow the application's heap before allocating big buffers/windows */
+    TryMaximizeHeap();
+
     SetupMenus();
     CreateDocumentWindow();
     AdjustMenus(); /* so Format/Style/Align/Zoom checkmarks are correct before any interaction */
