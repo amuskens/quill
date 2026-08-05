@@ -175,8 +175,11 @@ static void TryMaximizeHeap(void)
     /* First, ask the system for the full 4MB partition. If the system can
        satisfy it, great. On many hosts/emulators this may fail if the
        guest has less physical RAM configured. */
-    err = SetApplLimit(kMaxRequested);
-    (void)err; /* ignore result - we'll probe below to see what actually works */
+    /* Ask the Memory Manager to raise the application partition to 4 MiB.
+       SetApplLimit takes a Ptr argument and returns void, so call it directly.
+       Passing an integer as a Ptr is the classic API usage when requesting a
+       numeric new limit. */
+    SetApplLimit((Ptr)kMaxRequested);
 
     /* Probe: try to allocate a single contiguous block of up to half of
        the requested max (i.e., 2 MB). If that fails, halve and retry until
@@ -190,12 +193,13 @@ static void TryMaximizeHeap(void)
                requested partition). If SetApplLimit fails, ignore it - at
                least the large allocation succeeded which means usable heap
                is already large enough for that probe. */
-            DisposPtr(p);
+            DisposePtr(p);
             long desiredLimit = probe * 2;
             if (desiredLimit > kMaxRequested)
                 desiredLimit = kMaxRequested;
-            err = SetApplLimit(desiredLimit);
-            (void)err;
+            /* Request a partition roughly twice the probe so the probe is
+               about 50% of it. SetApplLimit is void and expects a Ptr. */
+            SetApplLimit((Ptr)desiredLimit);
             return;
         }
         probe /= 2; /* try a smaller probe */
