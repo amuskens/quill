@@ -686,9 +686,14 @@ static void DoImport(void)
     err = (kind == kImportRtf) ? ReadDocumentFromRtf(&gDoc, &reply.sfFile)
                                 : ReadDocumentFromDoc(&gDoc, &reply.sfFile);
     if (err != noErr) {
-        FailImportError(err, (Boolean)(kind == kImportOle2Doc));
-        DoNew();
-        return;
+        if (err == kImportTooLargeErr) {
+            /* Keep the partial content inserted by the reader and warn the user. */
+            Warn("The file was partially imported: only the portion that fit in memory was opened.");
+        } else {
+            FailImportError(err, (Boolean)(kind == kImportOle2Doc));
+            DoNew();
+            return;
+        }
     }
 
     /* Imported content isn't the same file as its source - "Save" should

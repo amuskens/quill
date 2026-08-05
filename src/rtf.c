@@ -797,11 +797,9 @@ OSErr ReadDocumentFromRtf(Document *doc, const FSSpec *src)
     free(buf);
 
     if (rp.tooLarge) {
-        /* Whatever was inserted before the ceiling was hit is a truncated,
-           confusing partial document, not a usable result - discard it
-           rather than leaving it in the window. */
-        TESetSelect(0, 32767, doc->body);
-        TEDelete(doc->body);
+        /* Keep whatever was inserted before the ceiling was hit. The caller
+           will warn the user that the import was truncated. */
+        TESetSelect(0, 0, doc->body);
         return kImportTooLargeErr;
     }
 
