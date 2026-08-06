@@ -87,6 +87,12 @@ on 68k System 7 (or Mini vMac).
   the dialog) altogether when the document is empty — nothing worth
   confirming the loss of.
 
+## Make a donation
+
+If you like the app and like these types of projects, please make a donation here:
+https://www.andersmuskens.com/donate
+Thank you for your support!
+
 ## Structure
 
 - `src/main.c` — the actual C entry point: just calls `RunApp()`.
